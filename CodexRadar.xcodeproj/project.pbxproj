@@ -1,0 +1,427 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		22D71FA45100273FAD2B1813 /* CodexRadarApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6449D83FE30C86F87F456560 /* CodexRadarApp.swift */; };
+		26D9D22BE0CC586EDFF0BC13 /* HeaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5F007D855EA0679FEC42F6C /* HeaderView.swift */; };
+		39B07E2F5EB3C4D151145B55 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = CED08450B1B4E84FB6C770B0 /* AppDelegate.swift */; };
+		52939BA0A17583671D834FE1 /* RadarParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A7474E971BADC55BCD0DF97 /* RadarParser.swift */; };
+		5DB9B2DE62A35D636C830261 /* ModelRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A4569B990CAFE57BE45D8D4 /* ModelRowView.swift */; };
+		66A289EBEF430E91FD461419 /* DesignTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20C2379B9B8C44276122619B /* DesignTokens.swift */; };
+		6A2908D8EBBA02A91C5DC769 /* RadarService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 60A0D0BF59E6218AD6F05049 /* RadarService.swift */; };
+		82B8654A074C7892440C8080 /* RadarViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FC7FA09B33D71C6EA600966 /* RadarViewModel.swift */; };
+		994539414CD1D5194743A353 /* VisualEffectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2893386E6F8C389FFD275F57 /* VisualEffectView.swift */; };
+		C4680F01CA53E5CAD7EE2E42 /* RadarModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A69924256A643B7A8190390 /* RadarModels.swift */; };
+		C78D9F3C93F2E522BB065FA4 /* PopoverRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C68CE5D620A29043326A282 /* PopoverRootView.swift */; };
+		CE8DADA49E4284F531F307A7 /* CurrentResponse.swift in Sources */ = {isa = PBXBuildFile; fileRef = 640DFDD11667C240BB9FECC0 /* CurrentResponse.swift */; };
+		DDBF149179314683461884C1 /* RadarGlyph.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1142E78B48E09ADC48E24D6 /* RadarGlyph.swift */; };
+		E5A3886795C86B70B540A594 /* StatusItemView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4285318E58D2DEA3C78FEA3 /* StatusItemView.swift */; };
+		F1E057E30EF1A454D5AF778B /* MenuListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A16659A42E01982FABDA9B27 /* MenuListView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		20C2379B9B8C44276122619B /* DesignTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignTokens.swift; sourceTree = "<group>"; };
+		2893386E6F8C389FFD275F57 /* VisualEffectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualEffectView.swift; sourceTree = "<group>"; };
+		2A4569B990CAFE57BE45D8D4 /* ModelRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelRowView.swift; sourceTree = "<group>"; };
+		2A69924256A643B7A8190390 /* RadarModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RadarModels.swift; sourceTree = "<group>"; };
+		2C68CE5D620A29043326A282 /* PopoverRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PopoverRootView.swift; sourceTree = "<group>"; };
+		2E6DCDF7D7C62B9AEE9492B6 /* CodexRadar.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CodexRadar.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		3A7474E971BADC55BCD0DF97 /* RadarParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RadarParser.swift; sourceTree = "<group>"; };
+		60A0D0BF59E6218AD6F05049 /* RadarService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RadarService.swift; sourceTree = "<group>"; };
+		640DFDD11667C240BB9FECC0 /* CurrentResponse.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CurrentResponse.swift; sourceTree = "<group>"; };
+		6449D83FE30C86F87F456560 /* CodexRadarApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexRadarApp.swift; sourceTree = "<group>"; };
+		7FC7FA09B33D71C6EA600966 /* RadarViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RadarViewModel.swift; sourceTree = "<group>"; };
+		A16659A42E01982FABDA9B27 /* MenuListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuListView.swift; sourceTree = "<group>"; };
+		B5F007D855EA0679FEC42F6C /* HeaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeaderView.swift; sourceTree = "<group>"; };
+		CED08450B1B4E84FB6C770B0 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		E1142E78B48E09ADC48E24D6 /* RadarGlyph.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RadarGlyph.swift; sourceTree = "<group>"; };
+		F4285318E58D2DEA3C78FEA3 /* StatusItemView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusItemView.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		015B6B6FDBB3502272B1802B /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				20C2379B9B8C44276122619B /* DesignTokens.swift */,
+				B5F007D855EA0679FEC42F6C /* HeaderView.swift */,
+				A16659A42E01982FABDA9B27 /* MenuListView.swift */,
+				2A4569B990CAFE57BE45D8D4 /* ModelRowView.swift */,
+				2C68CE5D620A29043326A282 /* PopoverRootView.swift */,
+				E1142E78B48E09ADC48E24D6 /* RadarGlyph.swift */,
+				F4285318E58D2DEA3C78FEA3 /* StatusItemView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		2964BC3FA0EAF8AC7B55D4DE /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				2E6DCDF7D7C62B9AEE9492B6 /* CodexRadar.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		4ABA0EE1320807A5837E4152 /* Model */ = {
+			isa = PBXGroup;
+			children = (
+				640DFDD11667C240BB9FECC0 /* CurrentResponse.swift */,
+				2A69924256A643B7A8190390 /* RadarModels.swift */,
+				3A7474E971BADC55BCD0DF97 /* RadarParser.swift */,
+			);
+			path = Model;
+			sourceTree = "<group>";
+		};
+		6BD9F8B1D47AFAD89604EA9D /* App */ = {
+			isa = PBXGroup;
+			children = (
+				CED08450B1B4E84FB6C770B0 /* AppDelegate.swift */,
+				6449D83FE30C86F87F456560 /* CodexRadarApp.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		98248107A726AE76C9510FA1 /* Service */ = {
+			isa = PBXGroup;
+			children = (
+				60A0D0BF59E6218AD6F05049 /* RadarService.swift */,
+			);
+			path = Service;
+			sourceTree = "<group>";
+		};
+		98D5D65E851BF70B1B9F18C0 /* ViewModel */ = {
+			isa = PBXGroup;
+			children = (
+				7FC7FA09B33D71C6EA600966 /* RadarViewModel.swift */,
+			);
+			path = ViewModel;
+			sourceTree = "<group>";
+		};
+		A435F58E9C0587A605D74AEB = {
+			isa = PBXGroup;
+			children = (
+				D8014E1B59F56128C53B6120 /* Sources */,
+				2964BC3FA0EAF8AC7B55D4DE /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		D8014E1B59F56128C53B6120 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				6BD9F8B1D47AFAD89604EA9D /* App */,
+				4ABA0EE1320807A5837E4152 /* Model */,
+				98248107A726AE76C9510FA1 /* Service */,
+				E5A4ACCA44A5DD50ADFB4D53 /* Support */,
+				98D5D65E851BF70B1B9F18C0 /* ViewModel */,
+				015B6B6FDBB3502272B1802B /* Views */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		E5A4ACCA44A5DD50ADFB4D53 /* Support */ = {
+			isa = PBXGroup;
+			children = (
+				2893386E6F8C389FFD275F57 /* VisualEffectView.swift */,
+			);
+			path = Support;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		4B33FBC743414720C26257C6 /* CodexRadar */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 963D51D1129E823027987A8A /* Build configuration list for PBXNativeTarget "CodexRadar" */;
+			buildPhases = (
+				7D47894687BE3A70C3534244 /* Sources */,
+				1E25475B4FE060A106762E8A /* Render Preview States */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CodexRadar;
+			packageProductDependencies = (
+			);
+			productName = CodexRadar;
+			productReference = 2E6DCDF7D7C62B9AEE9492B6 /* CodexRadar.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		DFBD791F063D800B36E35E1A /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					4B33FBC743414720C26257C6 = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Manual;
+					};
+				};
+			};
+			buildConfigurationList = E4311BD3F92554E2E2ACF4E1 /* Build configuration list for PBXProject "CodexRadar" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = A435F58E9C0587A605D74AEB;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 2964BC3FA0EAF8AC7B55D4DE /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				4B33FBC743414720C26257C6 /* CodexRadar */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		1E25475B4FE060A106762E8A /* Render Preview States */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Render Preview States";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "if [ \"${CONFIGURATION}\" = \"Debug\" ] && [ \"${CODEX_RADAR_SKIP_PREVIEW_RENDER:-0}\" != \"1\" ]; then\n  \"${SRCROOT}/Tools/render_preview_states.sh\" \"${SRCROOT}/build/preview-renders\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		7D47894687BE3A70C3534244 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				39B07E2F5EB3C4D151145B55 /* AppDelegate.swift in Sources */,
+				22D71FA45100273FAD2B1813 /* CodexRadarApp.swift in Sources */,
+				CE8DADA49E4284F531F307A7 /* CurrentResponse.swift in Sources */,
+				66A289EBEF430E91FD461419 /* DesignTokens.swift in Sources */,
+				26D9D22BE0CC586EDFF0BC13 /* HeaderView.swift in Sources */,
+				F1E057E30EF1A454D5AF778B /* MenuListView.swift in Sources */,
+				5DB9B2DE62A35D636C830261 /* ModelRowView.swift in Sources */,
+				C78D9F3C93F2E522BB065FA4 /* PopoverRootView.swift in Sources */,
+				DDBF149179314683461884C1 /* RadarGlyph.swift in Sources */,
+				C4680F01CA53E5CAD7EE2E42 /* RadarModels.swift in Sources */,
+				52939BA0A17583671D834FE1 /* RadarParser.swift in Sources */,
+				6A2908D8EBBA02A91C5DC769 /* RadarService.swift in Sources */,
+				82B8654A074C7892440C8080 /* RadarViewModel.swift in Sources */,
+				E5A3886795C86B70B540A594 /* StatusItemView.swift in Sources */,
+				994539414CD1D5194743A353 /* VisualEffectView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		0A98072369E762D25EC00EE5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 1.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.codexradar.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		4363329C6598C19B3256DC38 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.codexradar.app;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		52F1B6AB68266F715BB2E625 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.codexradar.app;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		A6D30A19E652740FBCEC8210 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = NO;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 1.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.codexradar.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		963D51D1129E823027987A8A /* Build configuration list for PBXNativeTarget "CodexRadar" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				52F1B6AB68266F715BB2E625 /* Debug */,
+				4363329C6598C19B3256DC38 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		E4311BD3F92554E2E2ACF4E1 /* Build configuration list for PBXProject "CodexRadar" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0A98072369E762D25EC00EE5 /* Debug */,
+				A6D30A19E652740FBCEC8210 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = DFBD791F063D800B36E35E1A /* Project object */;
+}
