@@ -8,7 +8,7 @@ enum HealthStatus: String, Codable {
 
 /// 单条模型评分。满分 150（12 个任务 × 12.5 分）。
 struct ModelIQEntry: Identifiable {
-    let id = UUID()
+    var id: String { "\(name)/\(tag)" }
     let name: String        // 例 "gpt-5.5"（来自 JSON 的 model）
     let tag: String         // 推理强度：low / medium / high / xhigh（来自 reasoning_effort）
     let score: Double       // 智商分

@@ -11,6 +11,7 @@ final class RadarViewModel: ObservableObject {
 
     private let service = RadarService()
     private var relativeTimer: Timer?
+    private var refreshToken: UInt = 0
 
     init() {
         // "距今" 每 30 秒刷新一次，保证相对时间实时走动。
@@ -19,16 +20,25 @@ final class RadarViewModel: ObservableObject {
         }
     }
 
+    deinit {
+        relativeTimer?.invalidate()
+    }
+
     func refresh() async {
+        refreshToken &+= 1
+        let token = refreshToken
         isLoading = true
-        defer { isLoading = false }
         do {
             let snap = try await service.fetch()
+            guard refreshToken == token else { return }
             snapshot = snap
             lastError = nil
             updateRelative()
+            isLoading = false
         } catch {
+            guard refreshToken == token else { return }
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            isLoading = false
         }
     }
 
