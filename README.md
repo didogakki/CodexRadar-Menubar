@@ -41,9 +41,9 @@ Tools/render_preview_states.sh
 
 ## 数据来源与三条关键规则
 
-接口：`https://codexradar.com/current.json`（启动拉取一次 + 每 5 分钟轮询 + ⌘R 手动刷新）。
+接口：`https://codexradar.com/current.json`（启动拉取一次 + 每 30 分钟轮询 + ⌘R 手动刷新）。
 
-为了尽量温和地使用上游服务，应用只请求公开 JSON 接口，默认 5 分钟轮询一次，不抓取页面、不提交数据。
+为了尽量温和地使用上游服务，应用只请求公开 JSON 接口，默认 30 分钟轮询一次，不抓取页面、不提交数据。
 
 1. **更新时间**读 `model_iq.quota_radar.updated_at`（ISO/UTC），按用户当前系统时区显示，并实时展示「距今」。
 2. **排序**：智商降序 → 同分先比底座版本（新者优先）→ 再比思考档（低档优先）。

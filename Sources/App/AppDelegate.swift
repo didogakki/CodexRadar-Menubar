@@ -16,7 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItemCancellable: AnyCancellable?
 
     private let websiteURL = URL(string: "https://codexradar.com/")!
-    private let pollInterval: TimeInterval = 300   // 5 分钟
+    private let pollInterval: TimeInterval = 1800  // 30 分钟
 
     // MARK: - 生命周期
 
