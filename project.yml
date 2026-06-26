@@ -15,6 +15,9 @@ settings:
     CODE_SIGN_IDENTITY: "-"
     DEVELOPMENT_TEAM: ""
     ENABLE_HARDENED_RUNTIME: "NO"
+  configs:
+    Debug:
+      ENABLE_TESTABILITY: "YES"
 targets:
   CodexRadar:
     type: application
@@ -45,3 +48,14 @@ targets:
           if [ "${CONFIGURATION}" = "Debug" ] && [ "${CODEX_RADAR_SKIP_PREVIEW_RENDER:-0}" != "1" ]; then
             "${SRCROOT}/Tools/render_preview_states.sh" "${SRCROOT}/build/preview-renders"
           fi
+  CodexRadarTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: Tests/CodexRadarTests
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+    dependencies:
+      - target: CodexRadar

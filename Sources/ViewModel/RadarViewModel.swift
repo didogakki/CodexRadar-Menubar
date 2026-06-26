@@ -14,8 +14,8 @@ final class RadarViewModel: ObservableObject {
     private var refreshToken: UInt = 0
 
     init() {
-        // "距今" 每 30 秒刷新一次，保证相对时间实时走动。
-        relativeTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        // "距今" 每分钟刷新一次，保证相对时间实时走动。
+        relativeTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.updateRelative() }
         }
     }

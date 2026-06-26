@@ -1,4 +1,4 @@
-// 底部菜单项块：hover 蓝色高亮 + 快捷键。
+// 底部操作块：打开仪表盘 ⌘O / 立即刷新 ⌘R，hover 蓝色高亮；附退出。
 import SwiftUI
 
 struct MenuListView: View {
@@ -6,9 +6,8 @@ struct MenuListView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            MenuRow(title: "打开网站", shortcut: "⌘O", action: actions.openWebsite)
+            MenuRow(title: "打开仪表盘", shortcut: "⌘O", action: actions.openWebsite)
             MenuRow(title: "立即刷新", shortcut: "⌘R", action: actions.refresh)
-            MenuRow(title: "测试通知", action: actions.testNotification)
 
             Rectangle()
                 .fill(DS.divider)
@@ -25,7 +24,6 @@ struct MenuListView: View {
 private struct MenuRow: View {
     let title: String
     var shortcut: String? = nil
-    var chevron: Bool = false
     let action: () -> Void
 
     @State private var hovering = false
@@ -40,11 +38,6 @@ private struct MenuRow: View {
                 Text(shortcut)
                     .font(DF.mono(12, .regular))
                     .foregroundStyle(hovering ? Color.white.opacity(0.85) : DS.sec(0.45))
-            }
-            if chevron {
-                Text("›")
-                    .font(DF.pro(13, .regular))
-                    .foregroundStyle(hovering ? Color.white : DS.sec(0.45))
             }
         }
         .padding(.horizontal, 9)

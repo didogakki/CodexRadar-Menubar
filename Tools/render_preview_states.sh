@@ -23,12 +23,8 @@ swiftc -DDEBUG -parse-as-library \
 "$BINARY_PATH" "$OUTPUT_DIR"
 
 if command -v magick >/dev/null 2>&1; then
-  magick -size 1098x965 xc:'#1F1F20' \
-    "$OUTPUT_DIR/success.png" -geometry +18+18 -composite \
-    "$OUTPUT_DIR/loading-initial.png" -geometry +384+18 -composite \
-    "$OUTPUT_DIR/loading-refresh.png" -geometry +750+18 -composite \
-    "$OUTPUT_DIR/error-initial.png" -geometry +18+518 -composite \
-    "$OUTPUT_DIR/error-cached.png" -geometry +384+518 -composite \
+  magick "$OUTPUT_DIR/popover.png" "$OUTPUT_DIR/loading-initial.png" "$OUTPUT_DIR/error-initial.png" \
+    -background '#1F1F20' -gravity north +append \
     "$OUTPUT_DIR/comparison.png"
   echo "$OUTPUT_DIR/comparison.png"
 else
