@@ -1,4 +1,4 @@
-// 覆盖 StatusItemTitleBuilder.make：无数据兜底、菜单栏只跟 Codex 冠军、IQ 阈值配色。
+// 覆盖 StatusItemTitleBuilder.make：无数据兜底、菜单栏只跟 GPT 候选、隐藏 IQ、IQ 阈值配色。
 import XCTest
 import AppKit
 @testable import CodexRadar
@@ -29,8 +29,17 @@ final class StatusItemTitleBuilderTests: XCTestCase {
         XCTAssertEqual(title.string, "—")
     }
 
+    func testMake_nonGPTCodexOnly_returnsDash() {
+        let snapshot = RadarSnapshot(
+            all: [scoredModel(name: "codex-mini", depth: "high", iq: 105, family: .codex)],
+            updatedAt: Date()
+        )
+        let title = StatusItemTitleBuilder.make(snapshot: snapshot)
+        XCTAssertEqual(title.string, "—")
+    }
+
     func testMake_picksCodexChampionEvenWhenClaudeScoresHigher() {
-        // menuBarBest 按业务规则只跟 Codex 族，即便综合分排第一的是 Claude。
+        // menuBarBest 按业务规则只跟 GPT 候选，即便综合分排第一的是 Claude。
         let snapshot = RadarSnapshot(
             all: [
                 scoredModel(name: "opus-4.8", depth: "max", iq: 100, family: .claude),
@@ -43,15 +52,13 @@ final class StatusItemTitleBuilderTests: XCTestCase {
         XCTAssertFalse(title.string.lowercased().contains("opus"))
     }
 
-    // 注：审核稿的测试缺口描述写的是「不显示 IQ」，但当前 StatusItemTitleBuilder.make 的实现
-    // 会在紧凑名后附加 " IQ <值>"。这里按现状断言，差异已在本次修复说明里向用户标出，未擅自改动显示逻辑。
-    func testMake_currentOutputIncludesCompactNameAndIQSuffix() {
+    func testMake_showsCompactNameWithoutIQSuffix() {
         let snapshot = RadarSnapshot(
             all: [scoredModel(name: "gpt-5.5", depth: "medium", iq: 87.5, family: .codex)],
             updatedAt: Date()
         )
         let title = StatusItemTitleBuilder.make(snapshot: snapshot)
-        XCTAssertEqual(title.string, "● 5.5·medium IQ 87.5")
+        XCTAssertEqual(title.string, "● 5.5·medium")
     }
 
     func testMake_colorThresholds() {

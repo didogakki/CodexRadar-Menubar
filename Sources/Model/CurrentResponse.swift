@@ -81,3 +81,221 @@ struct QuotaRadar: Decodable {
         case updatedAt = "updated_at"
     }
 }
+
+// MARK: - https://codexradar.com/api/radar-insights（站长推荐，权威源）
+
+/// 可从任意 JSON 值解码成功的占位类型：用于逐项容错时跳过坏元素并推进 unkeyed 容器游标。
+struct IgnoredJSONValue: Decodable {
+    init(from decoder: Decoder) throws {}
+}
+
+private extension KeyedDecodingContainer {
+    /// 上游计数字段可能在聚合后由整数变为 JSON 浮点数（例如 173.0 / 51.21）。
+    /// 统一宽松解码并四舍五入，避免单个可选计数字段令整条推荐或效率记录失效。
+    func decodeRoundedIntIfPresent(forKey key: Key) -> Int? {
+        guard contains(key), (try? decodeNil(forKey: key)) != true else { return nil }
+        if let value = try? decode(Int.self, forKey: key) { return value }
+        guard let value = try? decode(Double.self, forKey: key),
+              value.isFinite,
+              value >= Double(Int.min), value <= Double(Int.max) else { return nil }
+        return Int(value.rounded())
+    }
+}
+
+/// 站长推荐响应：schema 必须为 1；recommendations 保持服务端数组顺序。
+struct InsightsResponse: Decodable {
+    let schema: Int
+    let sourceUpdatedAt: String?
+    let comprehensivePoints: [ComprehensivePointDTO]?
+    let recommendations: [InsightGroupDTO]
+
+    enum CodingKeys: String, CodingKey {
+        case schema, recommendations, comprehensivePoints = "comprehensive_points"
+        case sourceUpdatedAt = "source_updated_at"
+    }
+}
+
+/// 综合推荐候选的 IQ（网站端用它给空推荐分组补算候选）。
+struct ComprehensivePointDTO: Decodable {
+    let model: String
+    let effort: String
+    let iq: Double
+}
+
+/// 单个推荐分组（key/title/rule/items）。items 逐项容错：坏条目只跳过自身，不连带整组失败。
+struct InsightGroupDTO: Decodable {
+    let key: String
+    let title: String
+    let rule: String?
+    let items: [InsightItemDTO]
+
+    enum CodingKeys: String, CodingKey {
+        case key, title, rule, items
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        key = try container.decode(String.self, forKey: .key)
+        title = try container.decode(String.self, forKey: .title)
+        rule = try container.decodeIfPresent(String.self, forKey: .rule)
+
+        var itemsContainer = try container.nestedUnkeyedContainer(forKey: .items)
+        var decoded: [InsightItemDTO] = []
+        while !itemsContainer.isAtEnd {
+            if let item = try? itemsContainer.decode(InsightItemDTO.self) {
+                decoded.append(item)
+            } else {
+                _ = try? itemsContainer.decode(IgnoredJSONValue.self)
+            }
+        }
+        items = decoded
+    }
+}
+
+/// 推荐条目：identity = model + effort。除 model/effort/iq 外均为可选，缺失不致条目失败。
+struct InsightItemDTO: Decodable {
+    let model: String
+    let effort: String
+    let iq: Double
+    let passed: Int?
+    let samples: Int?
+    let averageCostUSD: Double?
+    let averageDurationMinutes: Double?
+    let combinedCostIndex: Double?
+    let rule: String?
+    let trend48h: String?
+
+    enum CodingKeys: String, CodingKey {
+        case model, effort, iq, passed, samples, rule
+        case averageCostUSD = "average_cost_usd"
+        case averageDurationMinutes = "average_duration_minutes"
+        case combinedCostIndex = "combined_cost_index"
+        case trend48h = "trend_48h"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        model = try container.decode(String.self, forKey: .model)
+        effort = try container.decode(String.self, forKey: .effort)
+        iq = try container.decode(Double.self, forKey: .iq)
+        passed = container.decodeRoundedIntIfPresent(forKey: .passed)
+        samples = container.decodeRoundedIntIfPresent(forKey: .samples)
+        averageCostUSD = try container.decodeIfPresent(Double.self, forKey: .averageCostUSD)
+        averageDurationMinutes = try container.decodeIfPresent(Double.self, forKey: .averageDurationMinutes)
+        combinedCostIndex = try container.decodeIfPresent(Double.self, forKey: .combinedCostIndex)
+        rule = try container.decodeIfPresent(String.self, forKey: .rule)
+        // trend_48h 上游可能给字符串或数字，宽松解码为字符串。
+        if let s = try? container.decodeIfPresent(String.self, forKey: .trend48h) {
+            trend48h = s
+        } else if let d = try? container.decodeIfPresent(Double.self, forKey: .trend48h) {
+            trend48h = String(format: "%.2f", d)
+        } else {
+            trend48h = nil
+        }
+    }
+}
+
+// MARK: - https://codexradar.com/api/intelligence-efficiency-metrics（智力效率，权威指标源）
+
+/// 智力效率响应：兼容 schema 2/3；points 逐项容错，identity = model + effort。
+struct EfficiencyResponse: Decodable {
+    let schema: Int
+    let sourceUpdatedAt: String?
+    let points: [EfficiencyPointDTO]
+
+    enum CodingKeys: String, CodingKey {
+        case schema, points
+        case sourceUpdatedAt = "source_updated_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decode(Int.self, forKey: .schema)
+        sourceUpdatedAt = try container.decodeIfPresent(String.self, forKey: .sourceUpdatedAt)
+
+        var pointsContainer = try container.nestedUnkeyedContainer(forKey: .points)
+        var decoded: [EfficiencyPointDTO] = []
+        while !pointsContainer.isAtEnd {
+            if let point = try? pointsContainer.decode(EfficiencyPointDTO.self) {
+                decoded.append(point)
+            } else {
+                _ = try? pointsContainer.decode(IgnoredJSONValue.self)
+            }
+        }
+        points = decoded
+    }
+}
+
+/// 单个智力效率数据点。
+struct EfficiencyPointDTO: Decodable {
+    let model: String
+    let effort: String
+    let iq: Double
+    let passed: Int?
+    let validTasks: Int?
+    let averagePriceUSD: Double?
+    let averageMinutes: Double?
+    let combinedCostIndex: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case model, effort, iq, passed, total
+        case validTasks = "valid_tasks"
+        case averagePriceUSD = "average_price_usd"
+        case averageMinutes = "average_minutes"
+        case combinedCostIndex = "combined_cost_index"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        model = try container.decode(String.self, forKey: .model)
+        effort = try container.decode(String.self, forKey: .effort)
+        iq = try container.decode(Double.self, forKey: .iq)
+        passed = container.decodeRoundedIntIfPresent(forKey: .passed)
+        validTasks = container.decodeRoundedIntIfPresent(forKey: .validTasks)
+            ?? container.decodeRoundedIntIfPresent(forKey: .total)
+        averagePriceUSD = try container.decodeIfPresent(Double.self, forKey: .averagePriceUSD)
+        averageMinutes = try container.decodeIfPresent(Double.self, forKey: .averageMinutes)
+        combinedCostIndex = try container.decodeIfPresent(Double.self, forKey: .combinedCostIndex)
+    }
+}
+
+// MARK: - https://claudecoderadar.com/data/claude-code-radar.json
+
+/// Claude 参考数据源：iq.models[] 每个模型带 name + 历史序列数组（iq/pass/valid/cost/time），
+/// 数组元素可能为 null（当日缺测），取最后一个非 null 值作为最新结果。time 单位为小时。
+struct ClaudeRadarResponse: Decodable {
+    let iq: ClaudeIQBlock
+}
+
+struct ClaudeIQBlock: Decodable {
+    let models: [ClaudeModelSeries]
+}
+
+/// 单个 Claude 配置的历史序列（数组元素可为 null）。
+struct ClaudeModelSeries: Decodable {
+    let name: String            // "Opus 4.8 xhigh" / "Haiku 4.5"
+    let iq: [Double?]
+    let pass: [Double?]
+    let valid: [Double?]
+    let cost: [Double?]
+    let time: [Double?]         // 小时
+
+    private enum CodingKeys: String, CodingKey {
+        case name, label, iq, pass, valid, cost, time
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // 真实数据用 name；兼容旧的 label 字段
+        if let name = try container.decodeIfPresent(String.self, forKey: .name) {
+            self.name = name
+        } else {
+            self.name = try container.decode(String.self, forKey: .label)
+        }
+        iq = try container.decode([Double?].self, forKey: .iq)
+        pass = try container.decode([Double?].self, forKey: .pass)
+        valid = try container.decode([Double?].self, forKey: .valid)
+        cost = try container.decode([Double?].self, forKey: .cost)
+        time = try container.decode([Double?].self, forKey: .time)
+    }
+}

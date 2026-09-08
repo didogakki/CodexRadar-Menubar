@@ -61,7 +61,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             quit: { [weak self] in self?.quitApp() }
         )
         let root = PopoverRootView(vm: viewModel, actions: actions)
-        popover.contentViewController = NSHostingController(rootView: root)
+        let hosting = NSHostingController(rootView: root)
+        // 弹窗在「加载中」状态就被创建，NSPopover 默认只按首帧尺寸定型、之后不会跟着内容长大：
+        // 数据到位后视图仍停在两百多点高，榜单被压成两三行。让宿主控制器把 SwiftUI 的真实尺寸
+        // 同步成 preferredContentSize，弹窗才会随内容重新测量。
+        hosting.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = hosting
     }
 
     // MARK: - 弹窗开合

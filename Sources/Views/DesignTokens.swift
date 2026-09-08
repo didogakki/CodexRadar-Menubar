@@ -18,7 +18,8 @@ enum DS {
     static let border = Color.white.opacity(0.10)
     static let divider = Color.white.opacity(0.08)
     static let groupLine = Color.white.opacity(0.06)
-    static let width: CGFloat = 344
+    // 单行需容纳 名称+思考档+推荐 chip+价格+IQ；筛选条加长后的分段控件/厂商 chip 也需要更宽的容器。
+    static let width: CGFloat = 408
     static let cornerRadius: CGFloat = 13
 
     // 文字
@@ -35,6 +36,17 @@ enum DS {
     static let orange = Color(hex: 0xFF9F0A)
     static let red = Color(hex: 0xFF453A)
     static let blue = Color(hex: 0x0A84FF)
+    static let purple = Color(hex: 0xBF5AF2)
+
+    /// 推荐场景配色：日常开发蓝 / 难题攻坚紫，其余场景走中性次要色。
+    /// 按分组标题匹配（行上的 recommendedIn 存的就是标题）；服务端改名时自动落到中性色，不会出错。
+    static func sceneColor(_ groupTitle: String) -> Color {
+        switch groupTitle {
+        case "日常开发": return blue
+        case "难题攻坚": return purple
+        default:        return sec(0.5)
+        }
+    }
 
     /// 排名配色：1 绿 / 2 黄 / 3 橙 / 4 红（及以后均红）。
     static let rankColors: [Color] = [green, yellow, orange, red]

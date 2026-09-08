@@ -34,14 +34,6 @@ enum StatusItemTitleBuilder {
                 .kern: -0.3,
             ]
         ))
-        title.append(NSAttributedString(
-            string: " IQ \(best.iqLabel)",
-            attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium),
-                .foregroundColor: color,
-                .kern: -0.3,
-            ]
-        ))
         return title
     }
 

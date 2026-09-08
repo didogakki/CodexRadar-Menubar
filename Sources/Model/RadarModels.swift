@@ -1,11 +1,20 @@
 // 视图层使用的领域模型（已与解码层解耦）。
-// 综合分 = (iq/maxIq)^0.42 · (min(passed,8)/8)^0.13 · (minCost/cost)^0.30 · (minTime/time)^0.15，所有候选都展示。
+// 主路径：站长推荐（radar-insights）+ 智力效率（intelligence-efficiency-metrics）为权威源；
+// current.json 综合分公式只保留为完整失败回退（本地估算）。
 import Foundation
 
-/// Claude 参考数据（来自 HTML best-effort）的可用状态。
+/// Claude 参考数据（来自 claudecoderadar.com JSON，best-effort）的可用状态。
 enum ClaudeStatus {
     case ok
     case unavailable
+}
+
+/// 指标来源 —— 同一分区里可能混着两个站点的数据，量级不可横比（任务集不同，
+/// claudecoderadar 的花费是 $10~127 量级，codexradar 竞品列是 $1.7~17）。
+/// 只用于把性价比判定限制在同源内，不参与排序与分组。
+enum MetricSource: Hashable {
+    case codexRadar    // codexradar.com（intelligence-efficiency / insights / current.json）
+    case claudeRadar   // claudecoderadar.com
 }
 
 /// 模型族 —— 决定分组归属。
@@ -22,7 +31,287 @@ enum ModelFamily {
     }
 }
 
-/// 单条候选模型的原始记录（来自 HTML 对比表）。
+/// 厂商 —— 弹窗榜单内 Codex 模型的展示子分组，由模型名前缀/关键字派生。
+enum ModelVendor: String, CaseIterable, Hashable {
+    case openai
+    case xai
+    case deepseek
+    case google
+    case zhipu
+    case moonshot
+    case tencent
+    case other
+
+    /// 组标题。
+    var title: String {
+        switch self {
+        case .openai:   return "OpenAI"
+        case .xai:      return "Grok"
+        case .deepseek: return "DeepSeek"
+        case .google:   return "Google"
+        case .zhipu:    return "智谱"
+        case .moonshot: return "Moonshot"
+        case .tencent:  return "腾讯"
+        case .other:    return "其他"
+        }
+    }
+
+    /// 按模型名前缀/关键字派生厂商（大小写不敏感）；未知前缀归入"其他"，不丢弃模型。
+    /// Anthropic/Claude 命名的竞品条目不参与本归类，由 `isAnthropicCompetitor` 单独识别并
+    /// 整体从 Codex 展示中剔除（见 RadarSnapshot.codexGroupsByVendor 的注释）。
+    static func from(modelName: String) -> ModelVendor {
+        let n = modelName.lowercased()
+        if n.hasPrefix("gpt-") { return .openai }
+        if n.hasPrefix("grok-") { return .xai }
+        if n.contains("deepseek") { return .deepseek }
+        if n.contains("gemini") || n.hasPrefix("google") { return .google }
+        if n.contains("glm") || n.contains("zhipu") { return .zhipu }
+        if n.contains("kimi") || n.hasPrefix("moonshot") { return .moonshot }
+        if n.contains("hunyuan") || n.hasPrefix("tencent") { return .tencent }
+        return .other
+    }
+
+    /// Codex 竞品列表中的 Anthropic/Claude 命名条目：不进 Codex 榜单（不归入任何厂商，含"其他"），
+    /// 而是由 RadarParser.mergeAnthropicIntoClaude 并入 Claude Code 分区，与 claudecoderadar 的数据同区展示。
+    /// 两个源任务集不同、花费量级差一个数量级，性价比判定按 metricSource 分桶隔离（见 CostEfficiency）。
+    static func isAnthropicCompetitor(modelName: String) -> Bool {
+        modelName.lowercased().hasPrefix("claude-")
+    }
+
+    /// Codex 侧弹窗展示白名单：由 BoardSection.displayOrder 派生，顺序与榜单/筛选行完全一致，
+    /// 不再两处各写一份。未列入的厂商（Google/智谱/Moonshot/腾讯/其他）整体隐藏，
+    /// 不影响 snapshot.all / codexGroup 等权威数据。
+    static var displayWhitelist: [ModelVendor] {
+        BoardSection.displayOrder.compactMap { section in
+            if case .vendor(let vendor) = section { return vendor }
+            return nil
+        }
+    }
+}
+
+/// 榜单分区。`displayOrder` 是单一事实来源：既是弹窗里分组的上下顺序，也是筛选行的左右顺序。
+enum BoardSection: Hashable, Identifiable {
+    case vendor(ModelVendor)   // Codex 侧的厂商分组
+    case claude                // Claude Code 参考组
+
+    /// 展示顺序：OpenAI → Claude Code → Grok → DeepSeek。
+    static let displayOrder: [BoardSection] = [.vendor(.openai), .claude, .vendor(.xai), .vendor(.deepseek)]
+
+    var id: String {
+        switch self {
+        case .vendor(let vendor): return vendor.rawValue
+        case .claude:             return "claude"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .vendor(let vendor): return vendor.title
+        case .claude:             return ModelFamily.claude.title
+        }
+    }
+}
+
+/// Codex 弹窗展示层质量过滤阈值（集中管理，只影响榜单展示，不影响综合分/menuBarBest/菜单栏标题）。
+enum CodexDisplayQuality {
+    static let minTasks = 20
+    static let minIQ = 50.0
+    static let minDepthIQRatio = 0.6
+
+    /// 过滤样本量过少（tasks < minTasks）或质量过低（iq < minIQ）的候选；
+    /// 推荐项（recommendedIn 非空）、menuBarBest、gpt-* 始终保留，避免误伤权威推荐与菜单栏一致性。
+    /// 随后按模型名分组，过滤同一模型内 IQ 低于该模型（组内幸存档位中）最高档位 minDepthIQRatio 的思考档位；
+    /// 最高档位与自身的比值恒为 1，天然保留，无需额外特判；推荐项/menuBarBest 同样豁免此过滤。
+    static func filtered(_ models: [ScoredModel], menuBarBestID: String?) -> [ScoredModel] {
+        let protectedIDs = Set(models.filter { !$0.recommendedIn.isEmpty }.map(\.id))
+            .union(menuBarBestID.map { [$0] } ?? [])
+
+        let afterThreshold = models.filter { model in
+            if protectedIDs.contains(model.id) || model.result.isGPTModel { return true }
+            return model.result.tasks >= minTasks && model.result.iq >= minIQ
+        }
+
+        let maxIQByName = Dictionary(grouping: afterThreshold, by: \.result.name)
+            .mapValues { $0.map(\.result.iq).max() ?? 0 }
+
+        return afterThreshold.filter { model in
+            if protectedIDs.contains(model.id) { return true }
+            guard let maxIQ = maxIQByName[model.result.name], maxIQ > 0 else { return true }
+            return model.result.iq >= maxIQ * minDepthIQRatio
+        }
+    }
+}
+
+/// Codex 弹窗展示层单档收敛：gpt-5.6-terra / gpt-5.6-luna 候选档位较多，只展示一档，避免挤占版面。
+/// 只影响展示层分组，不影响 snapshot.all/menuBarBest 等权威数据。
+enum CodexSingleTierCondense {
+    /// 需要收敛为单档展示的模型名（与 result.name 小写完全匹配）。
+    static let targetNames: Set<String> = ["gpt-5.6-terra", "gpt-5.6-luna"]
+
+    /// 收敛规则：菜单栏当前最佳档位（menuBarBestID）优先，即使不是该模型 IQ 最高档；
+    /// 该模型候选中没有命中 menuBarBest 时取 IQ 最高档；IQ 并列时取 depth 字典序最小的一档，
+    /// 保证结果确定、可测试。
+    static func filtered(_ models: [ScoredModel], menuBarBestID: String?) -> [ScoredModel] {
+        let targetGroups = Dictionary(
+            grouping: models.filter { targetNames.contains($0.result.name.lowercased()) },
+            by: { $0.result.name.lowercased() }
+        )
+        guard !targetGroups.isEmpty else { return models }
+
+        var survivorIDs = Set<String>()
+        for candidates in targetGroups.values {
+            if let menuBarBestID, let matched = candidates.first(where: { $0.id == menuBarBestID }) {
+                survivorIDs.insert(matched.id)
+                continue
+            }
+            let winner = candidates.sorted { a, b in
+                a.result.iq != b.result.iq ? a.result.iq > b.result.iq : a.result.depth < b.result.depth
+            }.first
+            if let winner { survivorIDs.insert(winner.id) }
+        }
+
+        let droppedIDs = Set(targetGroups.values.flatMap { $0.map(\.id) }).subtracting(survivorIDs)
+        return models.filter { !droppedIDs.contains($0.id) }
+    }
+}
+
+/// Codex 弹窗展示层 DeepSeek 分组限额：现有质量过滤（+ 单档收敛）后最多展示 3 个候选；
+/// 推荐项优先保留，推荐项数量超过 3 个时全部保留（不误伤站长推荐）。只影响展示层，不影响权威数据。
+enum DeepSeekDisplayLimit {
+    static let maxCount = 3
+
+    /// 推荐项无条件保留（榜单按 IQ 排序后它们可能落在任意位置），其余保序补足到 maxCount 为止。
+    static func limited(_ models: [ScoredModel]) -> [ScoredModel] {
+        let recommendedIDs = Set(models.filter { !$0.recommendedIn.isEmpty }.map(\.id))
+        var remainingSlots = max(maxCount - recommendedIDs.count, 0)
+        return models.filter { model in
+            if recommendedIDs.contains(model.id) { return true }
+            guard remainingSlots > 0 else { return false }
+            remainingSlots -= 1
+            return true
+        }
+    }
+}
+
+/// 「只看前沿」展示层过滤：隐藏被组内其他档位压制的行。纯展示层，不影响权威数据与菜单栏选型。
+enum FrontierFilter {
+    /// 判定必须由调用方在**全量**组内算好后传入：先过滤再判定会让前沿基准漂移
+    /// （隐藏掉压制者之后，被压制的行反而会翻身变成前沿）。
+    ///
+    /// 保留三类行：未被压制的、没有判定的（缺价格或耗时，价格显示中性灰，不算被压制）、
+    /// 以及推荐项与菜单栏档位——顶部场景推荐区固定展示这些档位，榜单里对应行消失
+    /// 会造成「上面推荐了、下面找不到」。豁免留下的行由视图淡化显示。
+    static func isVisible(
+        _ model: ScoredModel,
+        verdicts: [String: CostVerdict],
+        protectedID: String?
+    ) -> Bool {
+        guard verdicts[model.id]?.isDominated ?? false else { return true }
+        return !model.recommendedIn.isEmpty || model.id == protectedID
+    }
+}
+
+/// 单行的性价比结论（组内比较，只影响展示）。
+struct CostVerdict {
+    /// 压制本档的最便宜档位；nil = 组内无人能压制它（性价比前沿）。
+    let dominator: ScoredModel?
+    /// 达到角标门槛的花费倍数（本档花费 ÷ 压制者花费）；未达门槛时为 nil。
+    let badgeMultiple: Double?
+
+    static let frontier = CostVerdict(dominator: nil, badgeMultiple: nil)
+
+    var isDominated: Bool { dominator != nil }
+
+    /// 角标文案：10 倍及以上取整（"×46"），10 倍以内保留一位小数（"×2.6"）——
+    /// 取整会把 2.6 夸成 3，量级已经很大时那点小数又没意义。
+    var badgeLabel: String? {
+        guard let badgeMultiple else { return nil }
+        return badgeMultiple >= 10
+            ? String(format: "×%.0f", badgeMultiple)
+            : String(format: "×%.1f", badgeMultiple)
+    }
+}
+
+/// 性价比判定：**只在同一分组内比较**（OpenAI 只跟 OpenAI 比，Grok / DeepSeek / Claude Code 各自成组）。
+/// 组内若存在另一档「IQ 不更低 + 花费更少 + 耗时不明显更慢」，则本档被压制，参照取其中最便宜的一档。
+/// 纯展示层结论：不改榜单排序，也不影响 menuBarBest / 菜单栏标题 / 场景推荐区。
+enum CostEfficiency {
+    /// 耗时容差：压制者只要"不明显更慢"就算数。没有它，快 1 分钟就能让一个贵一倍、IQ 还更低的
+    /// 档位逃脱标记（线上 deepseek-v4-pro high 29 分 vs flash-vision-exp max 30 分就是这种情况）。
+    static let timeTolerance = 1.1
+
+    /// 角标门槛：低于 2 倍不标，避免满屏角标；是否在前沿仍由价格配色区分。
+    static let badgeMultipleThreshold = 2.0
+
+    /// 一次算完整组（逐行调用会重复做 O(n²) 比较）。
+    /// 花费或耗时缺失的档位既不参与压制、也不会被判为被压制，直接不出现在结果里。
+    /// 组内再按 metricSource 分桶：Claude Code 分区混了两个站点的数据，任务集不同导致花费差一个量级，
+    /// 跨源比会把整批 claudecoderadar 条目误判为被 codexradar 侧的便宜档位压制。
+    static func verdicts(in group: [ScoredModel]) -> [String: CostVerdict] {
+        var result: [String: CostVerdict] = [:]
+        for (_, bucket) in Dictionary(grouping: group, by: \.result.metricSource) {
+            result.merge(verdictsWithinSource(bucket)) { current, _ in current }
+        }
+        return result
+    }
+
+    private static func verdictsWithinSource(_ group: [ScoredModel]) -> [String: CostVerdict] {
+        let comparable = group.filter { $0.result.cost > 0 && $0.result.timeMinutes > 0 }
+        var result: [String: CostVerdict] = [:]
+        for model in comparable {
+            let cheapestDominator = comparable.filter { other in
+                other.id != model.id
+                    && other.result.iq >= model.result.iq
+                    && other.result.cost < model.result.cost
+                    && Double(other.result.timeMinutes) <= Double(model.result.timeMinutes) * timeTolerance
+            }.min { $0.result.cost < $1.result.cost }
+
+            guard let cheapestDominator else {
+                result[model.id] = .frontier
+                continue
+            }
+            let multiple = model.result.cost / cheapestDominator.result.cost
+            result[model.id] = CostVerdict(
+                dominator: cheapestDominator,
+                badgeMultiple: multiple >= badgeMultipleThreshold ? multiple : nil
+            )
+        }
+        return result
+    }
+}
+
+/// 按厂商拆分的模型分组（组内保持传入顺序）。
+struct VendorGroup: Identifiable {
+    let vendor: ModelVendor
+    let models: [ScoredModel]
+
+    var id: ModelVendor { vendor }
+
+    /// 概览用去重模型名列表（保留组内首次出现顺序，同名不同档位只算一次）；
+    /// OpenAI 沿用现有紧凑命名习惯去掉 "gpt-" 前缀，其余厂商展示原名。
+    var overviewModelNames: [String] {
+        var seen = Set<String>()
+        var names: [String] = []
+        for model in models {
+            let raw = model.result.name
+            guard seen.insert(raw).inserted else { continue }
+            names.append(vendor == .openai ? raw.replacingOccurrences(of: "gpt-", with: "") : raw)
+        }
+        return names
+    }
+
+    /// 厂商概览行文本："5 · 6-astra, 5.6-sol, 5.5 +2"（数量 + 前 3 个实际模型名 + 剩余数）。
+    var overviewSummary: String {
+        let names = overviewModelNames
+        let shownCount = 3
+        let shown = names.prefix(shownCount).joined(separator: ", ")
+        let remaining = names.count - shownCount
+        let suffix = remaining > 0 ? " +\(remaining)" : ""
+        return "\(names.count) · \(shown)\(suffix)"
+    }
+}
+
+/// 单条候选模型的原始记录（来自两个 JSON 数据源）。
 struct ModelResult {
     let name: String        // "gpt-5.5" / "opus-4.8"
     let depth: String       // 思考档：medium / high / xhigh / max
@@ -32,13 +321,82 @@ struct ModelResult {
     let cost: Double        // 美元成本（越低越好）
     let timeMinutes: Int    // 耗时（分钟，越低越好）
     let family: ModelFamily
-    let isReference: Bool   // 来自 HTML 单日参考快照（Opus 列）
+    let isReference: Bool   // 参考性单日快照（Claude 参考列）
+    /// 指标来自哪个站点（默认 codexradar；claudecoderadar 解析处显式传入）。
+    var metricSource: MetricSource = .codexRadar
+
+    /// 菜单栏候选只接受 GPT 型号；大小写归一后要求标准 `gpt-` 前缀。
+    var isGPTModel: Bool { name.lowercased().hasPrefix("gpt-") }
 }
 
-/// 带综合分的模型（综合分由 RadarParser 计算）。
+/// 站长推荐条目（radar-insights，identity = model + effort）。
+/// 站长推荐接口的综合 IQ 数据点，用于在推荐分组为空时复刻网页端补算逻辑。
+struct ComprehensivePoint {
+    let model: String
+    let effort: String
+    let iq: Double
+
+    var id: String { "\(model)/\(effort)" }
+}
+
+struct InsightItem {
+    let model: String
+    let effort: String
+    let iq: Double
+    let passed: Int?
+    let samples: Int?
+    let averageCostUSD: Double?
+    let averageDurationMinutes: Double?
+    let combinedCostIndex: Double?   // 成本指标：越低越省，绝不作为能力排序依据
+    let rule: String?
+    let trend48h: String?
+
+    var id: String { "\(model)/\(effort)" }
+}
+
+/// 站长推荐分组（保持服务端数组顺序）。
+struct InsightGroup: Identifiable {
+    let key: String
+    let title: String
+    let rule: String?
+    let items: [InsightItem]
+
+    var id: String { key }
+}
+
+/// 智力效率数据点（intelligence-efficiency-metrics，identity = model + effort）。
+struct EfficiencyPoint {
+    let model: String
+    let effort: String
+    let iq: Double
+    let passed: Int?
+    let validTasks: Int?
+    let averagePriceUSD: Double?
+    let averageMinutes: Double?
+    let combinedCostIndex: Double?
+
+    var id: String { "\(model)/\(effort)" }
+}
+
+/// Codex 列表的数据来源，`rawValue` 即完整度（越大越完整）。
+/// 顺序有语义：RadarViewModel 用它拒绝「用更不完整的快照覆盖上一次的好快照」。
+enum CodexDataSource: Int, Comparable {
+    /// 只剩站长推荐条目可用（efficiency 与 current.json 都不可用），通常只有两三条，最小兜底。
+    case recommendationsOnly = 0
+    /// current.json 本地估算的完整候选列表（UI 标注「本地估算」）。
+    case localEstimate = 1
+    /// intelligence-efficiency 网站权威指标，覆盖最全。
+    case website = 2
+
+    static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
+/// 带综合分的模型（综合分由 RadarParser 计算；网站主源模式下 score 仅为 IQ 视觉比例）。
 struct ScoredModel: Identifiable {
     let result: ModelResult
     let score: Double
+    var recommendedIn: [String] = []   // 被哪些站长推荐分组选中（分组 title，服务端顺序）
+    var costIndex: Double? = nil       // combined_cost_index（越低越省，仅展示）
 
     var id: String { "\(result.name)/\(result.depth)" }
 
@@ -52,6 +410,9 @@ struct ScoredModel: Identifiable {
 
     /// 智力基准分（透传 result）。
     var iq: Double { result.iq }
+
+    /// 厂商分组（按模型名前缀派生，透传 result）。
+    var vendor: ModelVendor { ModelVendor.from(modelName: result.name) }
 
     /// IQ 数值文本（一位小数）："87.5"。
     var iqLabel: String { String(format: "%.1f", result.iq) }
@@ -70,6 +431,25 @@ struct ScoredModel: Identifiable {
         return "\(m)m"
     }
 
+    /// 有效价格标签（非正数不伪装为 $0.0，逐字段省略）。
+    var validCostLabel: String? { result.cost > 0 ? costLabel : nil }
+
+    /// 有效耗时标签（非正数不伪装为 0m，逐字段省略）。
+    var validTimeLabel: String? { result.timeMinutes > 0 ? timeLabel : nil }
+
+    /// 成本指数紧凑格式（3 位有效数字，兼顾 0.0002～100 量级；缺失/非正数省略）。
+    var costIndexLabel: String? {
+        guard let v = costIndex, v > 0 else { return nil }
+        return String(format: "%.3g", v)
+    }
+
+    /// 紧凑指标行："$23.9 · 1h25m · 指数0.27"；缺失字段逐个省略，全缺失返回 nil。
+    var metricsLabel: String? {
+        let parts = [validCostLabel, validTimeLabel, costIndexLabel.map { "指数\($0)" }]
+            .compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
     /// 菜单栏紧凑名："5.5·medium"（去掉 gpt- 前缀）。
     var compactName: String {
         let base = result.name.replacingOccurrences(of: "gpt-", with: "")
@@ -79,18 +459,78 @@ struct ScoredModel: Identifiable {
 
 /// 一次拉取后的视图快照。
 struct RadarSnapshot {
-    let all: [ScoredModel]   // 全部候选，综合分降序（仅组内可比）
-    let updatedAt: Date      // quota_radar.updated_at 的真实时刻（用于实时相对时间）
+    let all: [ScoredModel]   // 全部候选（已按展示顺序排列：Codex 推荐优先，Claude 按源 IQ 降序）
+    let updatedAt: Date      // 多源时间戳：insights/efficiency source_updated_at → current.json → 当前时间
     var claudeStatus: ClaudeStatus = .ok   // Claude 参考列是否抓取成功
+    var insights: [InsightGroup] = []      // 站长推荐分组（服务端顺序；本地估算回退时为空）
+    var codexSource: CodexDataSource = .localEstimate   // Codex 数据来自网站权威源还是本地估算
+    var localBestID: String? = nil   // current.json 本地冠军 identity（efficiency-only 时菜单栏独立回退用）
 
-    /// Codex 组（按综合分降序，索引即组内名次）。
+    /// Codex 组（保持解析层给定的展示顺序）。
     var codexGroup: [ScoredModel] { all.filter { $0.result.family == .codex } }
 
-    /// Claude Code 组（按综合分降序，索引即组内名次）。
+    /// Claude Code 组（保持解析层给定的展示顺序）。
     var claudeGroup: [ScoredModel] { all.filter { $0.result.family == .claude } }
 
-    /// 菜单栏跟随的模型：综合分最高的 Codex 族（业务规则：菜单栏只跟 Codex 冠军）。
-    var menuBarBest: ScoredModel? { all.first { $0.result.family == .codex } }
+    /// Codex 弹窗展示专用投影：剔除 Anthropic/Claude 命名竞品条目（正常路径下解析层已把它们搬进
+    /// Claude Code 分区，这里是直接构造快照时的兜底）→ 展示层质量过滤
+    /// （见 CodexDisplayQuality）→ Terra/Luna 单档收敛（见 CodexSingleTierCondense）；
+    /// 不影响 all / codexGroup / menuBarBest 等权威数据与菜单栏逻辑。
+    private var codexDisplayGroup: [ScoredModel] {
+        let withoutAnthropic = codexGroup.filter { !ModelVendor.isAnthropicCompetitor(modelName: $0.result.name) }
+        let qualityFiltered = CodexDisplayQuality.filtered(withoutAnthropic, menuBarBestID: menuBarBest?.id)
+        return CodexSingleTierCondense.filtered(qualityFiltered, menuBarBestID: menuBarBest?.id)
+    }
+
+    /// Codex 组按厂商拆分（厂商组顺序固定为 ModelVendor.displayWhitelist，跳过空组；
+    /// 组内保持 codexGroup 原有顺序；非白名单厂商整体隐藏，不落入"其他"）；
+    /// DeepSeek 组额外应用展示层限额（见 DeepSeekDisplayLimit）。
+    var codexGroupsByVendor: [VendorGroup] {
+        let grouped = Dictionary(grouping: codexDisplayGroup, by: \.vendor)
+        return ModelVendor.displayWhitelist.compactMap { vendor in
+            guard let models = grouped[vendor], !models.isEmpty else { return nil }
+            let displayed = vendor == .deepseek ? DeepSeekDisplayLimit.limited(models) : models
+            return VendorGroup(vendor: vendor, models: displayed)
+        }
+    }
+
+    /// 当前快照里确实有内容的分区，顺序即 BoardSection.displayOrder。
+    /// 筛选行只列出这些分区，榜单也只渲染这些分区——两者共用同一份来源，不会出现"筛了个空组"。
+    /// Claude 抓取失败时仍算有内容：该组会显示「数据提取失败」提示行。
+    var availableSections: [BoardSection] {
+        let vendors = Set(codexGroupsByVendor.map(\.vendor))
+        return BoardSection.displayOrder.filter { section in
+            switch section {
+            case .vendor(let vendor): return vendors.contains(vendor)
+            case .claude:             return !claudeDisplayGroup.isEmpty || claudeStatus == .unavailable
+            }
+        }
+    }
+
+    /// Claude Code 弹窗展示专用投影：剔除 fable-* 系列（内部代号，不作为 Claude 竞品展示）。
+    /// 该组合并了 claudecoderadar 与 codexradar 两个源的条目，两边都过这一道过滤；
+    /// 不影响 all / claudeGroup 等权威数据。
+    var claudeDisplayGroup: [ScoredModel] {
+        claudeGroup.filter { !$0.result.name.lowercased().hasPrefix("fable-") }
+    }
+
+    /// 菜单栏只推荐 GPT 型号：daily_development 首个可匹配 GPT → 本地 GPT 冠军 → 第一个 GPT。
+    var menuBarBest: ScoredModel? {
+        let gptCandidates = codexGroup.filter { $0.result.isGPTModel }
+        if let daily = insights.first(where: { $0.key == "daily_development" }),
+           let matched = daily.items.lazy.compactMap({ pick in
+               gptCandidates.first(where: {
+                   $0.result.name == pick.model && $0.result.depth == pick.effort
+               })
+           }).first {
+            return matched
+        }
+        if let localBestID,
+           let matched = gptCandidates.first(where: { $0.id == localBestID }) {
+            return matched
+        }
+        return gptCandidates.first
+    }
 
     /// 绝对检测时间戳："2026-06-25 14:28"（本地时区）。
     var checkedAtLabel: String {

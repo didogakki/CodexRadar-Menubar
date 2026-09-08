@@ -37,6 +37,12 @@ struct HeaderView: View {
                 Text("距今 \(vm.relativeLabel)")
                     .font(DF.pro(9, .regular))
                     .foregroundStyle(DS.sec(0.32))
+                // 保留上一次好快照 / 本次刷新失败时，明确标出榜单不是刚拉到的。
+                if vm.lastError != nil {
+                    Text("未更新，展示上次结果")
+                        .font(DF.pro(9, .regular))
+                        .foregroundStyle(DS.orange.opacity(0.85))
+                }
             }
         }
     }

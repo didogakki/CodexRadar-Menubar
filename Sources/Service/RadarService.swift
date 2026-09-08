@@ -1,4 +1,7 @@
-// 拉取并解析数据：current.json（Codex 评分主源 + 时间戳，必需）+ HTML 对比表（Claude 参考列，best-effort）。
+// 拉取并解析数据：
+// - radar-insights（站长推荐，权威源）+ intelligence-efficiency-metrics（智力效率，权威指标源）为 Codex 主数据；
+// - current.json 只保留为完整失败回退（本地估算），主源可用时其失败不致命；
+// - claude-code-radar.json（Claude 参考列，best-effort），失败绝不影响 Codex。
 import Foundation
 
 enum RadarServiceError: LocalizedError {
@@ -16,45 +19,110 @@ enum RadarServiceError: LocalizedError {
 }
 
 struct RadarService {
-    let htmlURL = URL(string: "https://codexradar.com/")!
+    let claudeURL = URL(string: "https://claudecoderadar.com/data/claude-code-radar.json")!
     let jsonURL = URL(string: "https://codexradar.com/current.json")!
+    // 与 codexradar.com 网页使用同源实时接口，避免旧子域/静态快照导致推荐不一致。
+    let insightsURL = URL(string: "https://codexradar.com/api/radar-insights")!
+    let efficiencyURL = URL(string: "https://codexradar.com/api/intelligence-efficiency-metrics")!
 
     func fetch() async throws -> RadarSnapshot {
-        // 并发拉取：JSON 是 Codex 主源（必需），HTML 仅供 Claude 参考列（best-effort）。
-        async let jsonData = data(from: jsonURL, timeout: 10)
-        async let htmlData = try? data(from: htmlURL, timeout: 20)
+        // 并发拉取四源：insights + efficiency 是 Codex 权威主源；current.json 仅回退；Claude best-effort。
+        async let insightsData = dataRetryingOnce(from: insightsURL, timeout: 10)
+        async let efficiencyData = dataRetryingOnce(from: efficiencyURL, timeout: 10)
+        async let jsonData = try? data(from: jsonURL, timeout: 10)
+        async let claudeData = try? data(from: claudeURL, timeout: 20)
 
-        // 主源：current.json → Codex。拉取或解析失败即致命错误（走 lastError）。
-        let json: Data
-        do {
-            json = try await jsonData
-        } catch let e as RadarServiceError {
-            throw e
-        }
-        let codex: [ModelResult]
-        do {
-            codex = try RadarParser.parseCodex(json: json)
-        } catch {
-            throw RadarServiceError.decode((error as? LocalizedError)?.errorDescription ?? "current.json 解析失败")
+        let insightsRaw = await insightsData
+        let efficiencyRaw = await efficiencyData
+        let json = await jsonData
+
+        // 主路径：efficiency points 构建 Codex 列表，insights 提供推荐分组与菜单栏选型。
+        let parsedInsights: [InsightGroup] = insightsRaw.flatMap { try? RadarParser.parseInsights(json: $0) } ?? []
+        let efficiency: [EfficiencyPoint] = efficiencyRaw.flatMap { try? RadarParser.parseEfficiency(json: $0) } ?? []
+        let comprehensive = insightsRaw.map(RadarParser.parseComprehensivePoints(json:)) ?? []
+        // 网页端会在 daily_development / hard_problems 为空时用 comprehensive_points + metrics 补算；
+        // 客户端按接口给出的 rule 复刻同一套规则，两组分别补算后保持服务端固有顺序。
+        let insights = RadarParser.supplementHardProblems(
+            insights: RadarParser.supplementDailyDevelopment(
+                insights: parsedInsights,
+                comprehensive: comprehensive,
+                efficiency: efficiency
+            ),
+            comprehensive: comprehensive,
+            efficiency: efficiency
+        )
+
+        let codex: [ScoredModel]
+        let insightGroups: [InsightGroup]
+        let codexSource: CodexDataSource
+        var localBestID: String? = nil
+
+        // current.json 本地估算结果（efficiency-only 时供菜单栏 identity 回退，全失败时作完整回退）。
+        let localScored: [ScoredModel]? = json
+            .flatMap { try? RadarParser.parseCodex(json: $0) }
+            .flatMap { try? RadarParser.scoreAndSort($0) }
+
+        if !efficiency.isEmpty {
+            // 主路径：efficiency 指标 + insights 推荐；insights 失败时列表保持网站排序，
+            // 菜单栏用本地冠军 identity 匹配网站列表回退（本地公式不改变网站排序、不伪装推荐）。
+            codex = RadarParser.buildCodexFromEfficiency(points: efficiency, insights: insights)
+            insightGroups = insights
+            codexSource = .website
+            if insights.isEmpty {
+                localBestID = localScored?.first?.id
+            }
+        } else if let scored = localScored {
+            // efficiency 失败：推荐条目本身只有寥寥几条（网站近期常返回空推荐分组），只拿它建列表会把
+            // 榜单塌缩成两三行；改用 current.json 本地估算的完整候选列表，并把站长推荐合并到匹配条目上
+            // （推荐 chip 与菜单栏选型仍归站长推荐）。UI 标注「本地估算」。
+            codex = RadarParser.applyRecommendations(scored, insights: insights)
+            insightGroups = insights
+            codexSource = .localEstimate
+            localBestID = scored.first?.id
+        } else if !insights.isEmpty {
+            // efficiency 与 current.json 都不可用：最后兜底，用推荐条目自身指标构建去重列表（仍为网站数据）。
+            // 标为 .recommendationsOnly，让 VM 能识别出这是最不完整的一档、不拿它覆盖上一次的好快照。
+            codex = RadarParser.buildCodexFromInsights(insights: insights)
+            insightGroups = insights
+            codexSource = .recommendationsOnly
+        } else {
+            throw RadarServiceError.decode("radar-insights / intelligence-efficiency / current.json 均不可用")
         }
 
-        // best-effort：HTML → Claude 参考列。任何失败或 0 个 Claude 都降级，绝不影响 Codex。
-        let claude: [ModelResult] = (await htmlData)
-            .map { String(decoding: $0, as: UTF8.self) }
-            .flatMap { try? RadarParser.parseClaude(html: $0) } ?? []
+        // best-effort：claude-code-radar.json → Claude 参考列（按源 IQ 降序），失败绝不影响 Codex。
+        let claudeRadar: [ScoredModel] = (await claudeData)
+            .flatMap { try? RadarParser.parseClaude(json: $0) }
+            .map { RadarParser.buildClaudeByIQ($0) } ?? []
+
+        // codexradar 的 claude-* 竞品条目并入 Claude Code 分区（雷达为主源，只补雷达缺的档位）。
+        // claudeRadar 抓取失败时这批条目仍能撑起该分区，所以可用性按合并后的结果判定。
+        let (codexWithoutAnthropic, claude) = RadarParser.mergeAnthropicIntoClaude(
+            codex: codex, claude: claudeRadar
+        )
         let claudeStatus: ClaudeStatus = claude.isEmpty ? .unavailable : .ok
 
-        let models: [ScoredModel]
-        do {
-            models = try RadarParser.scoreAndSort(codex + claude)
-        } catch {
-            throw RadarServiceError.decode((error as? LocalizedError)?.errorDescription ?? "数据解析失败")
-        }
+        // 多源时间戳：insights/efficiency 的 source_updated_at → current.json → 当前时间。
+        let updatedAt = insightsRaw.flatMap { RadarParser.parseInsightsTimestamp(json: $0) }
+            ?? efficiencyRaw.flatMap { RadarParser.parseEfficiencyTimestamp(json: $0) }
+            ?? json.flatMap { RadarParser.parseTimestamp(json: $0) }
+            ?? Date()
 
-        // 时间戳：JSON 的 quota_radar.updated_at；失败则回退到当前时间，不致命。
-        let updatedAt = RadarParser.parseTimestamp(json: json) ?? Date()
+        return RadarSnapshot(
+            all: codexWithoutAnthropic + claude,
+            updatedAt: updatedAt,
+            claudeStatus: claudeStatus,
+            insights: insightGroups,
+            codexSource: codexSource,
+            localBestID: localBestID
+        )
+    }
 
-        return RadarSnapshot(all: models, updatedAt: updatedAt, claudeStatus: claudeStatus)
+    /// 权威源（insights / efficiency）的瞬时失败会让整段榜单降级，代价远大于一次重试：
+    /// 失败后短暂退避再试一次，两次都失败才按不可用处理。
+    private func dataRetryingOnce(from url: URL, timeout: TimeInterval) async -> Data? {
+        if let first = try? await data(from: url, timeout: timeout) { return first }
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        return try? await data(from: url, timeout: timeout)
     }
 
     private func data(from url: URL, timeout: TimeInterval) async throws -> Data {
