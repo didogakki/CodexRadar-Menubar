@@ -1,7 +1,9 @@
-// current.json → Codex（主源）+ claude-code-radar.json → Claude（best-effort）+ 综合分 + 排序分组 + 时间戳。
+// current.json → Codex（主源）+ 综合分 + 排序分组 + 时间戳。
+// claude-code-radar.json → Claude 的解析函数（parseClaude/buildClaudeByIQ）仍保留，
+// 但 RadarService 已不再请求该源；线上 Claude Code 分区改由 codexradar 的 claude-* 竞品条目
+// 通过 mergeAnthropicIntoClaude 并入。
 //
 // Codex 评分数据来自 current.json 的 model_iq.latest / model_iq.comparisons；
-// Claude 参考列来自 claudecoderadar.com 的 claude-code-radar.json（iq.models[]）best-effort 抓取；
 // 时间戳来自 current.json 的 quota_radar.updated_at。综合分按 family 各自归一化。
 import Foundation
 
@@ -366,6 +368,8 @@ enum RadarParser {
     /// （雷达侧样本量 7~10 任务，竞品列常只有 1~5 任务）；codexradar 只补雷达没有的档位。
     /// 名字去掉 `claude-` 前缀与雷达侧对齐（`claude-opus-5` → `opus-5`），否则同一模型会拆成两行。
     /// 合并后按 IQ 降序重排、按合并后的 maxIq 重算 score（进度条比例）。
+    /// RadarService 目前固定传入空的 `claude` 列表（不再请求 claudecoderadar.com），
+    /// 上述冲突规则暂不会触发，`claude-*` 竞品条目直接全部落入 Claude Code 分区。
     ///
     /// 返回值：搬空 `claude-*` 之后的 Codex 列表 + 合并后的 Claude 列表。
     static func mergeAnthropicIntoClaude(

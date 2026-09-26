@@ -18,6 +18,28 @@ final class RadarViewModel: ObservableObject {
 
     static let onlyFrontierKey = "onlyFrontier"
 
+    /// 榜单展示模式：模型推荐（默认）/ 完整榜单。跨会话记忆，弹窗每次重开都保持；
+    /// 刷新（refresh()）只替换 snapshot，不touch这个字段，切换模式不会被下一次轮询重置。
+    @Published var listMode: ModelListMode = ModelListMode(
+        rawValue: UserDefaults.standard.string(forKey: RadarViewModel.listModeKey) ?? ""
+    ) ?? .recommendation {
+        didSet { UserDefaults.standard.set(listMode.rawValue, forKey: RadarViewModel.listModeKey) }
+    }
+
+    static let listModeKey = "listMode"
+
+    /// 「模型推荐」折叠行的展开状态（key = ModelRecommendationGroup.id）。只存于内存，
+    /// 不随 refresh() 或模式切换重置；不需要跨会话记忆，用户重开弹窗默认全部折叠即可。
+    @Published var expandedRecommendationIDs: Set<String> = []
+
+    func toggleRecommendationExpanded(_ id: String) {
+        if expandedRecommendationIDs.contains(id) {
+            expandedRecommendationIDs.remove(id)
+        } else {
+            expandedRecommendationIDs.insert(id)
+        }
+    }
+
     private let service = RadarService()
     private var relativeTimer: Timer?
     private var refreshToken: UInt = 0

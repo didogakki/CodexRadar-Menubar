@@ -3,7 +3,7 @@
 // current.json 综合分公式只保留为完整失败回退（本地估算）。
 import Foundation
 
-/// Claude 参考数据（来自 claudecoderadar.com JSON，best-effort）的可用状态。
+/// Claude 参考数据（来自 codexradar 的 claude-* 竞品条目，见 RadarParser.mergeAnthropicIntoClaude）的可用状态。
 enum ClaudeStatus {
     case ok
     case unavailable
@@ -15,6 +15,16 @@ enum ClaudeStatus {
 enum MetricSource: Hashable {
     case codexRadar    // codexradar.com（intelligence-efficiency / insights / current.json）
     case claudeRadar   // claudecoderadar.com
+
+    /// 「模型推荐」折叠行同名去重标签：同一模型名在两个源都出现时（如 Claude Code 分区里
+    /// claudecoderadar 直测 + codexradar 竞品列各一份），仅凭模型名无法区分是哪一条，
+    /// 需要一个短标签。measured/listed 用来暗示两者性质不同——不是同一份数据的两种展示。
+    var shortTag: String {
+        switch self {
+        case .codexRadar:  return "codexradar"
+        case .claudeRadar: return "claudecoderadar"
+        }
+    }
 }
 
 /// 模型族 —— 决定分组归属。
@@ -112,6 +122,20 @@ enum BoardSection: Hashable, Identifiable {
     }
 }
 
+/// 弹窗榜单展示模式：「模型推荐」（默认，按「模型 + 指标来源」折叠展示推荐结论）/
+/// 「完整榜单」（现有全部档位列表，行为不变）。跨会话记忆，见 RadarViewModel.listMode。
+enum ModelListMode: String {
+    case recommendation
+    case full
+
+    var title: String {
+        switch self {
+        case .recommendation: return "模型推荐"
+        case .full:           return "完整榜单"
+        }
+    }
+}
+
 /// Codex 弹窗展示层质量过滤阈值（集中管理，只影响榜单展示，不影响综合分/menuBarBest/菜单栏标题）。
 enum CodexDisplayQuality {
     static let minTasks = 20
@@ -191,6 +215,24 @@ enum DeepSeekDisplayLimit {
             return true
         }
     }
+
+    /// 同一限额应用到「模型推荐」折叠分组：一组一个模型，与完整榜单展示同样多的候选，
+    /// 避免同一 DeepSeek 分区在两种模式下看到不一样的条数。推荐判定（ModelRecommendationOutcome）
+    /// 已经用全量档位算完，这里只砍展示的组数，不重算、不合并任何组——不同模型/不同 metricSource
+    /// 天然是独立的组（见 groupedForRecommendation），不存在"合并冒充同一模型"的风险。
+    /// 保护规则与 limited(_:) 一致：组内任一档位带站长推荐（recommendedIn 非空）即整组无条件保留。
+    static func limitedGroups(_ groups: [ModelRecommendationGroup]) -> [ModelRecommendationGroup] {
+        let protectedIDs = Set(groups.filter { group in
+            group.tiers.contains { !$0.recommendedIn.isEmpty }
+        }.map(\.id))
+        var remainingSlots = max(maxCount - protectedIDs.count, 0)
+        return groups.filter { group in
+            if protectedIDs.contains(group.id) { return true }
+            guard remainingSlots > 0 else { return false }
+            remainingSlots -= 1
+            return true
+        }
+    }
 }
 
 /// 「只看前沿」展示层过滤：隐藏被组内其他档位压制的行。纯展示层，不影响权威数据与菜单栏选型。
@@ -204,10 +246,64 @@ enum FrontierFilter {
     static func isVisible(
         _ model: ScoredModel,
         verdicts: [String: CostVerdict],
-        protectedID: String?
+        protectedID: String? = nil,
+        additionalProtectedID: String? = nil
     ) -> Bool {
         guard verdicts[model.id]?.isDominated ?? false else { return true }
-        return !model.recommendedIn.isEmpty || model.id == protectedID
+        return !model.recommendedIn.isEmpty || model.id == protectedID || model.id == additionalProtectedID
+    }
+}
+
+/// 「模型推荐」折叠视图的整组前沿可见性 + 展开档位前沿可见性。纯展示层，
+/// 不改变推荐判定（ModelRecommendation）或权威数据；调用方在 verdicts 计算与保护名单的选择上
+/// 必须遵守下面两条不变量，否则会重新引入过的两个 bug：
+///
+/// 1. verdicts 必须由分区**全部原始 tiers**（`groups.flatMap(\.tiers)`，与推荐判定同一份候选池，
+///    含每个模型未被选为代表档的其它档位）算出——只用各组代表档算 verdicts 会漏掉「压制者本身
+///    不是任何组的代表档」这种情况，把本该被标记压制的代表档误判成前沿。
+/// 2. 保护名单不能只比较代表档 id：菜单栏当前档位可能落在组内非代表档的另一档上（推荐算法选的
+///    是更省钱的档位，菜单栏可能仍停在旧选择上），只比较代表档会把整组错误隐藏。
+enum ModelRecommendationFrontierFilter {
+    /// 折叠行的整组可见性（保留规则命中任一即保留）：
+    /// 1. 新推荐档：.recommended 结论——即使代表档被压制也保留整组，推荐了就不能在榜单里消失，
+    ///    与旧站长推荐豁免同一语义，只是主语换成新推荐算法的结论。
+    /// 2. 菜单栏当前档位落在本组内任意一档（不要求是代表档）。
+    /// 3. 旧站长推荐豁免（recommendedIn 非空）落在本组内任意一档，沿用 FrontierFilter 原语义。
+    /// 4. 无代表档（.unavailable，无可靠结论）：不知道该不该信任这组数据，不能因为没结论就整体
+    ///    隐藏或整体放行——退化为组内任一原始档「未被压制」（没有判定 = 缺价格/耗时，同样不算
+    ///    被压制，不隐藏未知数据）。
+    /// 5. 其余情况：看代表档是否被压制。
+    static func isGroupVisible(
+        _ group: ModelRecommendationGroup,
+        verdicts: [String: CostVerdict],
+        menuBarID: String?
+    ) -> Bool {
+        if case .recommended = group.outcome { return true }
+        if let menuBarID, group.tiers.contains(where: { $0.id == menuBarID }) { return true }
+        if group.tiers.contains(where: { !$0.recommendedIn.isEmpty }) { return true }
+        guard let model = group.outcome.displayModel else {
+            return group.tiers.contains { !(verdicts[$0.id]?.isDominated ?? false) }
+        }
+        return !(verdicts[model.id]?.isDominated ?? false)
+    }
+
+    /// 展开列表的单档可见性：保护名单与整组可见性一致（新推荐档 / 菜单栏档 / 旧站长推荐豁免），
+    /// forceShowAll 用于用户点了行内「显示全部档位」时整体旁路，不影响全局 onlyFrontier 开关。
+    static func visibleTiers(
+        in group: ModelRecommendationGroup,
+        verdicts: [String: CostVerdict],
+        menuBarID: String?,
+        forceShowAll: Bool
+    ) -> [ScoredModel] {
+        guard !forceShowAll else { return group.tiers }
+        return group.tiers.filter {
+            FrontierFilter.isVisible(
+                $0,
+                verdicts: verdicts,
+                protectedID: menuBarID,
+                additionalProtectedID: group.outcome.recommendedID
+            )
+        }
     }
 }
 
@@ -508,10 +604,49 @@ struct RadarSnapshot {
     }
 
     /// Claude Code 弹窗展示专用投影：剔除 fable-* 系列（内部代号，不作为 Claude 竞品展示）。
-    /// 该组合并了 claudecoderadar 与 codexradar 两个源的条目，两边都过这一道过滤；
+    /// 该组数据完全来自 codexradar 的 claude-* 竞品条目（RadarService 不再单独请求 claudecoderadar.com）；
     /// 不影响 all / claudeGroup 等权威数据。
     var claudeDisplayGroup: [ScoredModel] {
         claudeGroup.filter { !$0.result.name.lowercased().hasPrefix("fable-") }
+    }
+
+    /// 「模型推荐」榜单的分组来源：始终用**全量**数据（codexGroup 按厂商过滤 / claudeDisplayGroup），
+    /// 不经过 CodexDisplayQuality / CodexSingleTierCondense / DeepSeekDisplayLimit / CostEfficiency+
+    /// FrontierFilter 等展示层过滤——那些过滤只决定「完整榜单」怎么显示，绝不能改变推荐判定依据的候选池
+    /// （即前沿过滤开关切换、厂商内质量过滤都不改变某个模型该推荐哪一档）。
+    /// claudeDisplayGroup 剔除 fable-* 内部代号例外：那不是质量过滤，是「这压根不是外部竞品」的身份过滤，
+    /// 与 codexGroup 已经不含 claude-* 竞品条目（解析层已并入 Claude 分区）同一性质。
+    func recommendationGroups(for section: BoardSection) -> [ModelRecommendationGroup] {
+        let groups: [ModelRecommendationGroup]
+        switch section {
+        case .vendor(let vendor):
+            let pool = codexGroup.filter {
+                !ModelVendor.isAnthropicCompetitor(modelName: $0.result.name)
+                    && ModelVendor.from(modelName: $0.result.name) == vendor
+            }
+            groups = pool.groupedForRecommendation()
+        case .claude:
+            groups = claudeDisplayGroup.groupedForRecommendation()
+        }
+        // codexSource != .website：Codex 侧这一轮拿到的是 current.json 本地估算公式分
+        // （.localEstimate）或只剩站长推荐条目（.recommendationsOnly），都不是网站权威的真实
+        // 工程 IQ。凡是 metricSource == .codexRadar 的组（含并入 Claude 分区的 Anthropic 竞品
+        // 条目——它们与 codexSource 同一次抓取、同样会跟着降级）一律标记不可靠；claudeRadar
+        // 组不受影响，它由 claudeStatus 独立管控。可靠性标记不改变组的数量/身份，因此在
+        // DeepSeek 展示层限额之前或之后做都一样，这里先做以保持与旧代码顺序一致。
+        let reliabilityAdjusted: [ModelRecommendationGroup]
+        if codexSource != .website {
+            reliabilityAdjusted = groups.map { $0.metricSource == .codexRadar ? $0.markedUnreliableCodexSource() : $0 }
+        } else {
+            reliabilityAdjusted = groups
+        }
+        // DeepSeek 展示层限额（见 DeepSeekDisplayLimit）：只砍这里返回的展示组数，
+        // 不影响上面已经用全量档位算完的推荐结论——与「完整榜单」的 DeepSeekDisplayLimit.limited
+        // 保持同样的条数，避免「模型推荐」比「完整榜单」多出好几条的错觉。
+        if case .vendor(.deepseek) = section {
+            return DeepSeekDisplayLimit.limitedGroups(reliabilityAdjusted)
+        }
+        return reliabilityAdjusted
     }
 
     /// 菜单栏只推荐 GPT 型号：daily_development 首个可匹配 GPT → 本地 GPT 冠军 → 第一个 GPT。
@@ -539,5 +674,156 @@ struct RadarSnapshot {
         formatter.timeZone = .autoupdatingCurrent
         formatter.dateFormat = "yyyy-MM-dd HH:mm"
         return formatter.string(from: updatedAt)
+    }
+}
+
+// MARK: - 模型推荐（同模型同源比较，真实工程 IQ + 均价，纯函数）
+//
+// 与旧的「综合分」（RadarParser.score，混了通过数/耗时）、insights 场景推荐（daily_development /
+// hard_problems，按接口 rule 各自的排序口径）都无关：模型推荐只认 ScoredModel.result.iq（网站给出的
+// 真实工程有效 IQ）与 result.cost（均价），在同一模型 + 同一 metricSource 的档位之间比较，
+// 避免混用不同口径互相打架。
+
+/// 思考档展开顺序：low → medium → high → xhigh → max → ultra 依次在前；其余未知档按字典序跟在后面，
+/// 未知档之间也保持稳定、可预期的顺序（不依赖数据源给出的原始顺序）。
+enum DepthTier {
+    private static let known = ["low", "medium", "high", "xhigh", "max", "ultra"]
+
+    /// 排序键：已知档 → (下标, "")；未知档 → (known.count, 小写档名)。用于 sorted(by:) 的 `<` 比较。
+    static func sortKey(_ depth: String) -> (Int, String) {
+        let normalized = depth.lowercased()
+        if let index = known.firstIndex(of: normalized) { return (index, "") }
+        return (known.count, normalized)
+    }
+}
+
+/// 单个「模型 + 指标来源」分组的推荐结论。
+enum ModelRecommendationOutcome {
+    /// 组内没有任何有效（有限、非 NaN、> 0）真实工程 IQ 成绩——没有可推荐的依据。
+    /// 达到 95% 门槛的档位里没有一个有效正数价格——同样不能推荐，价格缺失不能伪装成 $0。
+    enum Reason {
+        case noValidScore
+        case noValidPrice
+        /// codexRadar 指标来自 codexSource == .localEstimate（current.json 本地估算公式）或
+        /// .recommendationsOnly（只剩站长推荐条目，无独立效率测量）时触发：这两种模式下的
+        /// IQ 不是网站权威的真实工程测量，不能冒充「比较后选出的」工程推荐（见
+        /// RadarSnapshot.recommendationGroups）。claudeRadar 指标不受此约束——它由
+        /// claudeStatus 独立管控，与 Codex 侧的抓取状态无关。
+        case unreliableCodexSource
+    }
+
+    case recommended(ScoredModel, maxIQ: Double, thresholdIQ: Double)
+    /// 组内只有一个有效成绩的档位：没有第二档可比，不冒充「比较后选出的」可靠推荐。
+    case singleComparableTier(ScoredModel)
+    case unavailable(Reason)
+
+    /// 折叠行展示用的档位（推荐档，或唯一可比较档；无可靠数据时为 nil）。
+    var displayModel: ScoredModel? {
+        switch self {
+        case .recommended(let model, _, _):    return model
+        case .singleComparableTier(let model): return model
+        case .unavailable:                     return nil
+        }
+    }
+
+    /// 推荐档的 identity（仅 .recommended 时非 nil），供展开列表高亮对应行。
+    var recommendedID: String? {
+        if case .recommended(let model, _, _) = self { return model.id }
+        return nil
+    }
+}
+
+/// 模型推荐核心纯函数：给定同一模型 + 同一 metricSource 的全部档位，挑出「工程能力不明显掉档、
+/// 价格最低」的那一档。调用方传入的顺序即平局仲裁顺序（先出现者赢），不在此处重新排序。
+///
+/// 规则：
+/// 1. 有效成绩 = result.iq 有限且 > 0。少于两档有效成绩时构不成「比较」（见 singleComparableTier /
+///    unavailable(.noValidScore)）。
+/// 2. 门槛 = 全部有效成绩档位（**含没有价格的档位**）中的最高 IQ × 95%。不能先剔除缺价格的档位再取
+///    最高分——那会让真正的最高分因为缺价格被排除在外、门槛虚低，把本该落选的低 IQ 档位错误纳入候选。
+/// 3. 候选 = IQ ≥ 门槛 且 价格有限、为正数的档位。
+/// 4. 候选中取价格最低者；同价平局取调用方给定顺序中先出现的一档。
+enum ModelRecommendation {
+    static let iqRetentionRatio = 0.95
+
+    static func evaluate(_ tiers: [ScoredModel]) -> ModelRecommendationOutcome {
+        let validScore = tiers.filter { $0.result.iq.isFinite && $0.result.iq > 0 }
+        guard !validScore.isEmpty else { return .unavailable(.noValidScore) }
+        guard validScore.count >= 2 else { return .singleComparableTier(validScore[0]) }
+
+        let maxIQ = validScore.map(\.result.iq).max()!
+        let threshold = maxIQ * iqRetentionRatio
+        let candidates = validScore.filter {
+            $0.result.iq >= threshold && $0.result.cost.isFinite && $0.result.cost > 0
+        }
+        guard !candidates.isEmpty else { return .unavailable(.noValidPrice) }
+
+        var best = candidates[0]
+        for candidate in candidates.dropFirst() where candidate.result.cost < best.result.cost {
+            best = candidate
+        }
+        return .recommended(best, maxIQ: maxIQ, thresholdIQ: threshold)
+    }
+}
+
+/// 「模型推荐」榜单一行：同一模型 + 同一指标来源的全部档位，折叠展示推荐结论，
+/// 展开显示该模型全部档位（按 DepthTier 稳定排序，与推荐判定用的原始顺序互不影响）。
+struct ModelRecommendationGroup: Identifiable {
+    let modelName: String
+    let metricSource: MetricSource
+    let tiers: [ScoredModel]   // 展开顺序：DepthTier 排序
+    var outcome: ModelRecommendationOutcome   // 可由 RadarSnapshot.recommendationGroups 降级为不可靠
+
+    var id: String {
+        let sourceTag = metricSource == .claudeRadar ? "claudeRadar" : "codexRadar"
+        return "\(modelName)#\(sourceTag)"
+    }
+
+    /// 折叠行是否可展开：只看实际档位数，不看推荐结论（outcome）。多档但只有一条有效 IQ 的组
+    /// （outcome 仍是 .singleComparableTier）照样可展开——展开列表展示的是全部原始档位，
+    /// 与"是否参与过推荐比较"无关；真正的单档（tiers.count <= 1）才没有东西可展开。
+    var isExpandable: Bool { tiers.count > 1 }
+
+    init(modelName: String, metricSource: MetricSource, tiers: [ScoredModel]) {
+        self.modelName = modelName
+        self.metricSource = metricSource
+        // 推荐判定用调用方传入的原始顺序（见 ModelRecommendation.evaluate 的平局规则），
+        // 展开列表另外按思考档排序展示，两者互不干扰。
+        self.outcome = ModelRecommendation.evaluate(tiers)
+        self.tiers = tiers.sorted { DepthTier.sortKey($0.result.depth) < DepthTier.sortKey($1.result.depth) }
+    }
+
+    /// 展开列表（真实档位数据）不受影响，只是折叠行不再声称「推荐」/「仅一档」结论——
+    /// 那两种结论都暗示"比较过、可信"，而本地估算/站长推荐综合分撑不起这个暗示。
+    func markedUnreliableCodexSource() -> ModelRecommendationGroup {
+        var copy = self
+        copy.outcome = .unavailable(.unreliableCodexSource)
+        return copy
+    }
+}
+
+extension Array where Element == ScoredModel {
+    /// 按「模型名 + 指标来源」分组，不跨源合并（同名不同站点口径不可比，见 MetricSource）；
+    /// 分组顺序与组内档位顺序都保持首次出现的原始顺序。
+    func groupedForRecommendation() -> [ModelRecommendationGroup] {
+        var order: [String] = []
+        var names: [String: String] = [:]
+        var sources: [String: MetricSource] = [:]
+        var tiersByKey: [String: [ScoredModel]] = [:]
+
+        for model in self {
+            let key = "\(model.result.name)#\(model.result.metricSource)"
+            if tiersByKey[key] == nil {
+                order.append(key)
+                names[key] = model.result.name
+                sources[key] = model.result.metricSource
+            }
+            tiersByKey[key, default: []].append(model)
+        }
+
+        return order.compactMap { key in
+            guard let name = names[key], let source = sources[key], let tiers = tiersByKey[key] else { return nil }
+            return ModelRecommendationGroup(modelName: name, metricSource: source, tiers: tiers)
+        }
     }
 }

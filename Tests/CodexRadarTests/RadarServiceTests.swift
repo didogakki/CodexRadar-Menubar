@@ -12,9 +12,21 @@ final class StubURLProtocol: URLProtocol {
     static var stubs: [String: Stub] = [:]
     static var errors: [String: Error] = [:]
 
+    /// 实际发起过的请求 URL（startLoading 可能在 URLSession 的内部队列线程上跑，用锁保护）。
+    private static let requestedURLsLock = NSLock()
+    private static var _requestedURLs: [String] = []
+    static var requestedURLs: [String] {
+        requestedURLsLock.lock()
+        defer { requestedURLsLock.unlock() }
+        return _requestedURLs
+    }
+
     static func reset() {
         stubs = [:]
         errors = [:]
+        requestedURLsLock.lock()
+        _requestedURLs = []
+        requestedURLsLock.unlock()
     }
 
     override class func canInit(with request: URLRequest) -> Bool {
@@ -26,6 +38,9 @@ final class StubURLProtocol: URLProtocol {
 
     override func startLoading() {
         guard let url = request.url else { return }
+        Self.requestedURLsLock.lock()
+        Self._requestedURLs.append(url.absoluteString)
+        Self.requestedURLsLock.unlock()
         if let error = Self.errors[url.absoluteString] {
             client?.urlProtocol(self, didFailWithError: error)
             return
@@ -94,11 +109,62 @@ final class RadarServiceTests: XCTestCase {
         super.tearDown()
     }
 
-    /// 给全部四个源设置默认失败，逐个测试再按需覆盖，避免真实网络请求。
+    /// 给全部三个源设置默认失败，逐个测试再按需覆盖，避免真实网络请求。
     private func failAll(_ service: RadarService) {
-        for url in [service.insightsURL, service.efficiencyURL, service.jsonURL, service.claudeURL] {
+        for url in [service.insightsURL, service.efficiencyURL, service.jsonURL] {
             StubURLProtocol.errors[url.absoluteString] = URLError(.timedOut)
         }
+    }
+
+    // MARK: - 只使用 codexradar.com：不再请求 claudecoderadar.com
+
+    /// RadarService 只暴露三个 URL，且全部指向 codexradar.com——不存在指向其它域名的属性，
+    /// 也就不存在可以对其发起请求的入口。
+    func testServiceExposesOnlyCodexRadarURLs() {
+        let service = RadarService()
+        for url in [service.insightsURL, service.efficiencyURL, service.jsonURL] {
+            XCTAssertEqual(url.host, "codexradar.com", "\(url) 不应指向 codexradar.com 之外的域名")
+        }
+    }
+
+    /// 回归：即使环境里仍留有 claudecoderadar.com 的可用 stub（模拟旧代码残留场景），
+    /// fetch() 也绝不能请求它——Claude Code 分区必须只从 codexradar 的 claude-* 竞品条目里取数据，
+    /// 混入 claudecoderadar 的数据（这里用一个明显不同的 iq=999 探测）就说明代码又悄悄发起了该请求。
+    func testFetch_neverRequestsClaudeRadarDotCom_evenWhenStubExists() async throws {
+        let service = RadarService()
+        failAll(service)
+        StubURLProtocol.errors[service.efficiencyURL.absoluteString] = nil
+        let metricsWithClaudeEntry = """
+        {"schema":3,"points":[
+          {"model":"claude-opus-5","effort":"high","iq":108.5,"passed":9,"total":12,
+           "average_price_usd":60.0,"average_minutes":200.0,"combined_cost_index":0.55}
+        ]}
+        """
+        StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = .init(data: Data(metricsWithClaudeEntry.utf8), statusCode: 200)
+
+        let legacyClaudeURL = "https://claudecoderadar.com/data/claude-code-radar.json"
+        let legacyClaudeJSON = """
+        {"iq":{"models":[
+          {"name":"Opus 5","iq":[999.0],"pass":[9.0],"valid":[12.0],"cost":[1.0],"time":[0.1]}
+        ]}}
+        """
+        StubURLProtocol.stubs[legacyClaudeURL] = .init(data: Data(legacyClaudeJSON.utf8), statusCode: 200)
+
+        let snapshot = try await service.fetch()
+
+        // 直接断言请求记录：即使 legacyClaudeURL 的 stub 就摆在那儿（StubURLProtocol.canInit
+        // 会接受它），fetch() 也绝不能真正发起过这个请求——只断言结果里没混入 iq=999 不够，
+        // 那也可能是「请求了但没用返回值」这种同样错误但会被结果断言放过的实现。
+        XCTAssertFalse(StubURLProtocol.requestedURLs.contains(legacyClaudeURL),
+                        "fetch() 不应向 claudecoderadar.com 发起任何请求")
+        XCTAssertTrue(StubURLProtocol.requestedURLs.contains(service.efficiencyURL.absoluteString),
+                      "sanity check：efficiency 源确实被请求过，说明上面的断言不是因为请求全没发出去")
+
+        // Claude Code 分区只应有 codexradar 的 claude-opus-5 一条（重命名为 opus-5/high，
+        // metricSource == .codexRadar）；iq=999 的 claudecoderadar 数据绝不能出现。
+        XCTAssertEqual(snapshot.claudeGroup.map(\.id), ["opus-5/high"])
+        XCTAssertEqual(snapshot.claudeGroup.first?.result.metricSource, .codexRadar)
+        XCTAssertEqual(snapshot.claudeGroup.first?.result.iq, 108.5)
     }
 
     func testFetch_primarySourcesSucceed_currentJSONFails_stillReturnsWebsiteData() async throws {
@@ -176,7 +242,9 @@ final class RadarServiceTests: XCTestCase {
         XCTAssertEqual(snapshot.updatedAt, RadarParser.parseISO("2026-06-26T05:44:34Z"))
     }
 
-    func testFetch_efficiencySucceeds_claudeFails_returnsCodexAndMarksClaudeUnavailable() async throws {
+    /// efficiency 数据里没有任何 `claude-*` 前缀条目（Claude Code 分区的唯一数据来源）时，
+    /// 该分区必须判为不可用，不能影响 Codex 组本身。
+    func testFetch_efficiencySucceeds_noClaudeEntries_marksClaudeUnavailable() async throws {
         let service = RadarService()
         failAll(service)
         StubURLProtocol.errors[service.insightsURL.absoluteString] = nil
@@ -190,7 +258,7 @@ final class RadarServiceTests: XCTestCase {
         XCTAssertTrue(snapshot.claudeGroup.isEmpty)
         switch snapshot.claudeStatus {
         case .unavailable: break
-        case .ok: XCTFail("expected claudeStatus to be .unavailable when Claude fetch fails")
+        case .ok: XCTFail("expected claudeStatus to be .unavailable when no claude-* entries are present")
         }
     }
 
@@ -291,15 +359,8 @@ final class RadarServiceTests: XCTestCase {
            "average_price_usd":20.0,"average_minutes":80.0,"combined_cost_index":0.20}
         ]}
         """
-        let claudeReferenceJSON = """
-        {"iq":{"models":[
-          {"name":"Opus 5","iq":[105.0],"pass":[9.0],"valid":[12.0],"cost":[58.0],"time":[3.2]}
-        ]}}
-        """
         StubURLProtocol.errors[service.efficiencyURL.absoluteString] = nil
-        StubURLProtocol.errors[service.claudeURL.absoluteString] = nil
         StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = .init(data: Data(multiVendorMetrics.utf8), statusCode: 200)
-        StubURLProtocol.stubs[service.claudeURL.absoluteString] = .init(data: Data(claudeReferenceJSON.utf8), statusCode: 200)
 
         let snapshot = try await service.fetch()
 
@@ -321,22 +382,17 @@ final class RadarServiceTests: XCTestCase {
         XCTAssertNil(
             snapshot.codexGroupsByVendor.first { $0.models.map(\.result.name).contains(where: { $0.hasPrefix("claude-") }) }
         )
-        // Codex 侧的 claude-* 条目并入 Claude Code 分区：去掉 claude- 前缀与雷达侧对齐，按 IQ 降序，
-        // 雷达已有的 identity 不被覆盖（这里雷达是 opus-5 无档位、竞品列是 opus-5/high，两者共存）。
+        // Codex 侧的 claude-* 条目并入 Claude Code 分区：去掉 claude- 前缀，按 IQ 降序；
+        // 不再有独立的 claudecoderadar 雷达数据，Claude Code 分区完全来自这批竞品条目。
         XCTAssertEqual(
             snapshot.claudeGroup.map(\.id),
-            ["opus-5/high", "opus-5/", "sonnet-5/medium"]
+            ["opus-5/high", "sonnet-5/medium"]
         )
-        // 来源标记保留，供性价比判定分桶：雷达条目 .claudeRadar，竞品列条目 .codexRadar。
-        XCTAssertEqual(
-            snapshot.claudeGroup.first { $0.id == "opus-5/" }?.result.metricSource, .claudeRadar
-        )
-        XCTAssertEqual(
-            snapshot.claudeGroup.first { $0.id == "opus-5/high" }?.result.metricSource, .codexRadar
-        )
+        // 来源标记全部为 .codexRadar：不再请求 claudecoderadar.com，claudeRadar 来源不会出现。
+        XCTAssertTrue(snapshot.claudeGroup.allSatisfy { $0.result.metricSource == .codexRadar })
         switch snapshot.claudeStatus {
         case .ok: break
-        case .unavailable: XCTFail("expected claudeStatus to be .ok when Claude reference fetch succeeds")
+        case .unavailable: XCTFail("expected claudeStatus to be .ok when codexradar has claude-* entries")
         }
         // 菜单栏仍只推荐 GPT 型号，即便 Grok/Claude 分数更高。
         XCTAssertTrue(snapshot.menuBarBest?.result.isGPTModel ?? false)
@@ -450,6 +506,60 @@ final class RadarServiceTests: XCTestCase {
         XCTAssertEqual(vm.snapshot?.codexGroup.map(\.id), goodIDs)
         XCTAssertEqual(vm.lastError, RadarViewModel.staleNotice)
         XCTAssertFalse(vm.isLoading)
+    }
+
+    // MARK: - 榜单模式 / 展开状态在刷新前后保留（refresh() 只替换 snapshot，不 touch 这两个字段）
+
+    @MainActor
+    func testViewModelRefresh_doesNotResetListModeOrExpandedState_onFailure() async {
+        let originalListMode = UserDefaults.standard.object(forKey: RadarViewModel.listModeKey)
+        defer {
+            if let originalListMode {
+                UserDefaults.standard.set(originalListMode, forKey: RadarViewModel.listModeKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: RadarViewModel.listModeKey)
+            }
+        }
+        let service = RadarService()
+        failAll(service)   // 四源全失败 → fetch() 必然 throws，走 catch 分支
+
+        let vm = RadarViewModel()
+        vm.listMode = .full
+        vm.expandedRecommendationIDs = ["gpt-5.5#codexRadar"]
+
+        await vm.refresh()
+
+        XCTAssertNotNil(vm.lastError, "四源全失败应走错误分支")
+        XCTAssertEqual(vm.listMode, .full, "刷新失败不应重置榜单模式")
+        XCTAssertEqual(vm.expandedRecommendationIDs, ["gpt-5.5#codexRadar"], "刷新失败不应重置展开状态")
+    }
+
+    @MainActor
+    func testViewModelRefresh_doesNotResetListModeOrExpandedState_onSuccess() async {
+        let originalListMode = UserDefaults.standard.object(forKey: RadarViewModel.listModeKey)
+        defer {
+            if let originalListMode {
+                UserDefaults.standard.set(originalListMode, forKey: RadarViewModel.listModeKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: RadarViewModel.listModeKey)
+            }
+        }
+        let service = RadarService()
+        failAll(service)
+        StubURLProtocol.errors[service.insightsURL.absoluteString] = nil
+        StubURLProtocol.errors[service.efficiencyURL.absoluteString] = nil
+        StubURLProtocol.stubs[service.insightsURL.absoluteString] = .init(data: Data(insightsJSON.utf8), statusCode: 200)
+        StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = .init(data: Data(efficiencyJSON.utf8), statusCode: 200)
+
+        let vm = RadarViewModel()
+        vm.listMode = .full
+        vm.expandedRecommendationIDs = ["gpt-5.4#codexRadar"]
+
+        await vm.refresh()
+
+        XCTAssertNotNil(vm.snapshot)
+        XCTAssertEqual(vm.listMode, .full, "刷新成功也不应重置榜单模式")
+        XCTAssertEqual(vm.expandedRecommendationIDs, ["gpt-5.4#codexRadar"], "刷新成功也不应重置展开状态")
     }
 
 }

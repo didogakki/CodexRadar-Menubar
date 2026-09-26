@@ -1,7 +1,8 @@
 // 拉取并解析数据：
 // - radar-insights（站长推荐，权威源）+ intelligence-efficiency-metrics（智力效率，权威指标源）为 Codex 主数据；
 // - current.json 只保留为完整失败回退（本地估算），主源可用时其失败不致命；
-// - claude-code-radar.json（Claude 参考列，best-effort），失败绝不影响 Codex。
+// - Claude Code 分区不再单独请求 claudecoderadar.com，完全来自 intelligence-efficiency-metrics 里的
+//   claude-* 竞品条目（见 RadarParser.mergeAnthropicIntoClaude），跟 Codex 数据同一次抓取。
 import Foundation
 
 enum RadarServiceError: LocalizedError {
@@ -19,18 +20,16 @@ enum RadarServiceError: LocalizedError {
 }
 
 struct RadarService {
-    let claudeURL = URL(string: "https://claudecoderadar.com/data/claude-code-radar.json")!
     let jsonURL = URL(string: "https://codexradar.com/current.json")!
     // 与 codexradar.com 网页使用同源实时接口，避免旧子域/静态快照导致推荐不一致。
     let insightsURL = URL(string: "https://codexradar.com/api/radar-insights")!
     let efficiencyURL = URL(string: "https://codexradar.com/api/intelligence-efficiency-metrics")!
 
     func fetch() async throws -> RadarSnapshot {
-        // 并发拉取四源：insights + efficiency 是 Codex 权威主源；current.json 仅回退；Claude best-effort。
+        // 并发拉取三源：insights + efficiency 是 Codex 权威主源；current.json 仅回退。
         async let insightsData = dataRetryingOnce(from: insightsURL, timeout: 10)
         async let efficiencyData = dataRetryingOnce(from: efficiencyURL, timeout: 10)
         async let jsonData = try? data(from: jsonURL, timeout: 10)
-        async let claudeData = try? data(from: claudeURL, timeout: 20)
 
         let insightsRaw = await insightsData
         let efficiencyRaw = await efficiencyData
@@ -89,15 +88,11 @@ struct RadarService {
             throw RadarServiceError.decode("radar-insights / intelligence-efficiency / current.json 均不可用")
         }
 
-        // best-effort：claude-code-radar.json → Claude 参考列（按源 IQ 降序），失败绝不影响 Codex。
-        let claudeRadar: [ScoredModel] = (await claudeData)
-            .flatMap { try? RadarParser.parseClaude(json: $0) }
-            .map { RadarParser.buildClaudeByIQ($0) } ?? []
-
-        // codexradar 的 claude-* 竞品条目并入 Claude Code 分区（雷达为主源，只补雷达缺的档位）。
-        // claudeRadar 抓取失败时这批条目仍能撑起该分区，所以可用性按合并后的结果判定。
+        // Claude Code 分区完全来自 codexradar 的 claude-* 竞品条目：不再请求 claudecoderadar.com，
+        // mergeAnthropicIntoClaude 的 claude 参数固定传空列表（函数本身逻辑不变，只是雷达数据源永远为空）。
+        // 这批条目跟 Codex 数据同一次抓取，取不到时该分区判为不可用。
         let (codexWithoutAnthropic, claude) = RadarParser.mergeAnthropicIntoClaude(
-            codex: codex, claude: claudeRadar
+            codex: codex, claude: []
         )
         let claudeStatus: ClaudeStatus = claude.isEmpty ? .unavailable : .ok
 

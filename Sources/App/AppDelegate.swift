@@ -35,6 +35,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
         button.target = self
         button.action = #selector(togglePopover)
+        // 菜单栏管理器（Thaw 等）按 AX identifier / title 识别图标，并用 identifier 拼系统的位置键；
+        // 标题里的型号会变，所以 identifier 固定且与 autosaveName 一致，动态文字只放进 AXValue，
+        // 避免每次换型号被当成新图标，位置写入也不会落到错误的键上。
+        statusItem.autosaveName = "com.codexradar.app.statusItem"
+        button.setAccessibilityIdentifier("com.codexradar.app.statusItem")
 
         updateStatusItemTitle()
         statusItemCancellable = viewModel.$snapshot
@@ -45,8 +50,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func updateStatusItemTitle() {
-        statusItem.button?.attributedTitle = StatusItemTitleBuilder.make(snapshot: viewModel.snapshot)
-        statusItem.length = NSStatusItem.variableLength
+        guard let button = statusItem.button else { return }
+        let title = StatusItemTitleBuilder.make(snapshot: viewModel.snapshot)
+        guard !button.attributedTitle.isEqual(to: title) else { return }
+        button.attributedTitle = title
+        button.setAccessibilityTitle("CodexRadar")
+        button.setAccessibilityValue(title.string)
     }
 
     private func setupPopover() {

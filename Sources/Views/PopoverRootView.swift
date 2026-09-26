@@ -57,16 +57,22 @@ struct PopoverRootView: View {
     private var content: some View {
         if let snapshot = vm.snapshot {
             VStack(spacing: 0) {
+                ModeSwitchBar(vm: vm)
+                Rectangle().fill(DS.divider).frame(height: 0.5)
+
                 // 筛选行与榜单共用 snapshot.availableSections，顺序一致、不会筛出空组。
                 FilterBarView(vm: vm, sections: snapshot.availableSections)
                 Rectangle().fill(DS.divider).frame(height: 0.5)
 
-                // 场景推荐区：推荐条目都是 GPT 档位，因此只在「全部」或选中 OpenAI 时展示。
-                let showPicks = vm.boardFilter == nil || vm.boardFilter == .vendor(.openai)
-                let picks = showPicks ? ScenarioPicksView.groups(in: snapshot) : []
-                if !picks.isEmpty {
-                    ScenarioPicksView(groups: picks)
-                    Rectangle().fill(DS.divider).frame(height: 0.5)
+                // 场景推荐区：只在「完整榜单」模式展示——「模型推荐」视图本身就是推荐结论，
+                // 两套推荐口径（综合 IQ 场景推荐 vs 真实工程 IQ + 均价推荐）同时出现会互相打架。
+                if vm.listMode == .full {
+                    let showPicks = vm.boardFilter == nil || vm.boardFilter == .vendor(.openai)
+                    let picks = showPicks ? ScenarioPicksView.groups(in: snapshot) : []
+                    if !picks.isEmpty {
+                        ScenarioPicksView(groups: picks)
+                        Rectangle().fill(DS.divider).frame(height: 0.5)
+                    }
                 }
 
                 let maxHeight = Self.boardMaxHeight(screenHeight: NSScreen.main?.visibleFrame.height ?? 900)
@@ -75,15 +81,17 @@ struct PopoverRootView: View {
                 // 而 popover 的提议高度反过来又取决于内容高度，会互相咬死（首帧只有两百多点时
                 // 永远选中滚动分支，榜单被压成两三行），也会在无界提议下选中不滚动分支被裁掉。
                 ScrollView(.vertical) {
-                    board(snapshot)
+                    boardContent(snapshot)
                         .background(GeometryReader { geo in
                             Color.clear.preference(key: BoardHeightKey.self, value: geo.size.height)
                         })
                 }
                 .frame(height: boardHeight > 0 ? min(boardHeight, maxHeight) : nil)
                 .onPreferenceChange(BoardHeightKey.self) { boardHeight = $0 }
-                // 切换「只看前沿」会一次性增减十几行，硬跳会很突兀。
+                // 切换「只看前沿」/展开推荐行会一次性增减若干行，硬跳会很突兀。
                 .animation(.easeInOut(duration: 0.2), value: vm.onlyFrontier)
+                .animation(.easeInOut(duration: 0.2), value: vm.listMode)
+                .animation(.easeInOut(duration: 0.2), value: vm.expandedRecommendationIDs)
             }
             .opacity(vm.isLoading ? 0.5 : 1)   // 刷新时降低透明度（骨架感）
             .animation(.easeInOut(duration: 0.2), value: vm.isLoading)
@@ -96,6 +104,17 @@ struct PopoverRootView: View {
             .padding(.vertical, 18)
         } else {
             Color.clear.frame(height: 8)   // 首次即失败：错误已在头部显示
+        }
+    }
+
+    /// 按当前榜单模式分派：模型推荐（默认）走折叠分组视图，完整榜单走现有全量档位列表。
+    @ViewBuilder
+    private func boardContent(_ snapshot: RadarSnapshot) -> some View {
+        switch vm.listMode {
+        case .recommendation:
+            ModelRecommendationBoardView(vm: vm, snapshot: snapshot)
+        case .full:
+            board(snapshot)
         }
     }
 
@@ -190,6 +209,51 @@ struct FilterBarView: View {
     private func vendorChip(title: String, isSelected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
+                .font(DF.pro(10, .medium))
+                .foregroundStyle(isSelected ? Color.white : DS.sec(0.55))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(isSelected ? DS.blue : Color.white.opacity(0.06)))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+    }
+}
+
+/// 榜单模式切换：模型推荐（默认）/ 完整榜单，仅两个选项。跟 FilterBarView 一样自绘 capsule
+/// 而非原生 Picker(.menu)/Menu 下拉：AppDelegate 中 popover.behavior = .transient，原生下拉
+/// 背后的 NSMenu 会开启独立事件跟踪循环，被 transient popover 判定为"外部交互"而立即关窗
+/// （哪怕只是二选一的低频开关，NSMenu 事件循环一开，popover 照样被判定关闭，跟点击频率无关）。
+struct ModeSwitchBar: View {
+    @ObservedObject var vm: RadarViewModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 4) {
+                modeChip(.recommendation)
+                modeChip(.full)
+            }
+
+            Spacer(minLength: 6)
+
+            if vm.listMode == .recommendation {
+                Text("推荐 = 真实工程 IQ 达该模型最高档 95% 内取价最低档；价格为等价按量计费估算，非订阅扣费")
+                    .font(DF.pro(9, .regular))
+                    .foregroundStyle(DS.sec(0.35))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.trailing)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: 240, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 15)
+        .padding(.vertical, 6)
+    }
+
+    private func modeChip(_ mode: ModelListMode) -> some View {
+        let isSelected = vm.listMode == mode
+        return Button { vm.listMode = mode } label: {
+            Text(mode.title)
                 .font(DF.pro(10, .medium))
                 .foregroundStyle(isSelected ? Color.white : DS.sec(0.55))
                 .padding(.horizontal, 9)

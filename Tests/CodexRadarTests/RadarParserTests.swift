@@ -1007,6 +1007,126 @@ final class RadarParserTests: XCTestCase {
         XCTAssertTrue(FrontierFilter.isVisible(pricey, verdicts: reRanked, protectedID: nil))
     }
 
+    // MARK: - 「模型推荐」折叠视图的整组/展开档位前沿过滤（ModelRecommendationFrontierFilter）
+    //
+    // 覆盖上一轮 frontier 修复遗留的两个 bug：
+    // 1. 只用各组代表档算 verdicts 会漏掉「压制者本身不是任何组代表档」的情况；
+    // 2. 保护名单只比较代表档 id，菜单栏档位落在组内非代表档时会把整组错误隐藏。
+
+    func testModelRecommendationFrontierFilter_nonRepresentativeTierParticipatesAsSuppressor() {
+        // 组 A：唯一档，本身构不成组内比较（singleComparableTier）。
+        let repA = costRow("gpt-a", "medium", iq: 75, cost: 10, minutes: 20)
+        let groupA = ModelRecommendationGroup(modelName: "gpt-a", metricSource: .codexRadar, tiers: [repA])
+        guard case .singleComparableTier = groupA.outcome else { return XCTFail("expected .singleComparableTier") }
+
+        // 组 B：low 档更便宜但 IQ 够不到 95% 门槛，代表档是 high；low 因此是组 B 的非代表档，
+        // 却仍是能压制别的模型的真实候选。
+        let low = costRow("gpt-b", "low", iq: 80, cost: 2, minutes: 20)
+        let high = costRow("gpt-b", "high", iq: 95, cost: 30, minutes: 20)
+        let groupB = ModelRecommendationGroup(modelName: "gpt-b", metricSource: .codexRadar, tiers: [low, high])
+        guard case .recommended(let representativeB, _, _) = groupB.outcome, representativeB.id == high.id else {
+            return XCTFail("expected group B 代表档为 high")
+        }
+
+        let fullTiersVerdicts = CostEfficiency.verdicts(in: (groupA.tiers + groupB.tiers))
+        XCTAssertTrue(fullTiersVerdicts[repA.id]?.isDominated ?? false,
+                       "非代表档 low（IQ 不更低、更便宜、不明显更慢）也应参与压制判定")
+        XCTAssertFalse(ModelRecommendationFrontierFilter.isGroupVisible(groupA, verdicts: fullTiersVerdicts, menuBarID: nil))
+
+        // 反例：只拿各组代表档算 verdicts（旧 bug）会漏掉 low 这个真正的压制者，
+        // high 更贵、压不倒 repA，于是 repA 被误判为前沿。
+        let representativeOnlyVerdicts = CostEfficiency.verdicts(in: [repA, representativeB])
+        XCTAssertFalse(representativeOnlyVerdicts[repA.id]?.isDominated ?? false,
+                        "仅用代表档算 verdicts 会漏掉非代表档压制者（旧 bug 的重现条件）")
+    }
+
+    func testModelRecommendationFrontierFilter_suppressedNewRecommendationStaysVisible() {
+        let medium = costRow("gpt-c", "medium", iq: 90, cost: 6, minutes: 20)
+        let high = costRow("gpt-c", "high", iq: 95, cost: 8, minutes: 20)
+        let groupC = ModelRecommendationGroup(modelName: "gpt-c", metricSource: .codexRadar, tiers: [medium, high])
+        guard case .recommended(let picked, _, _) = groupC.outcome, picked.id == high.id else {
+            return XCTFail("expected 推荐 high")
+        }
+
+        // 外部一档把新推荐档 high 也压制了。
+        let cheaperElsewhere = costRow("gpt-d", "max", iq: 100, cost: 1, minutes: 20)
+        let verdicts = CostEfficiency.verdicts(in: groupC.tiers + [cheaperElsewhere])
+        XCTAssertTrue(verdicts[high.id]?.isDominated ?? false)
+
+        XCTAssertTrue(ModelRecommendationFrontierFilter.isGroupVisible(groupC, verdicts: verdicts, menuBarID: nil),
+                       "新推荐档即使被压制也不能从折叠榜单里消失")
+    }
+
+    func testModelRecommendationFrontierFilter_nonRepresentativeMenuBarTierProtectsGroup() {
+        let repD = costRow("gpt-e", "medium", iq: 75, cost: 10, minutes: 20)
+        // 菜单栏当前档位是同模型的另一档，且这一档缺有效 IQ（不参与推荐判定的有效成绩集合），
+        // 因此代表档仍是 repD（singleComparableTier），但菜单栏档位确实存在于组内。
+        let menuBarTier = costRow("gpt-e", "high", iq: 0, cost: 50, minutes: 20)
+        let groupD = ModelRecommendationGroup(modelName: "gpt-e", metricSource: .codexRadar, tiers: [repD, menuBarTier])
+        guard case .singleComparableTier(let representativeD) = groupD.outcome, representativeD.id == repD.id else {
+            return XCTFail("expected 代表档为 repD")
+        }
+
+        let suppressor = costRow("gpt-f", "low", iq: 80, cost: 2, minutes: 20)
+        let verdicts = CostEfficiency.verdicts(in: groupD.tiers + [suppressor])
+        XCTAssertTrue(verdicts[repD.id]?.isDominated ?? false)
+
+        XCTAssertTrue(
+            ModelRecommendationFrontierFilter.isGroupVisible(groupD, verdicts: verdicts, menuBarID: menuBarTier.id),
+            "菜单栏当前档位落在组内非代表档时，整组也不能被隐藏"
+        )
+        XCTAssertFalse(
+            ModelRecommendationFrontierFilter.isGroupVisible(groupD, verdicts: verdicts, menuBarID: "unrelated-id"),
+            "菜单栏档位不在这组里时不该被保护"
+        )
+    }
+
+    func testModelRecommendationFrontierFilter_expandedListKeepsProtectedHidesRest() {
+        let low = costRow("gpt-g", "low", iq: 50, cost: 3, minutes: 10)
+        let medium = costRow("gpt-g", "medium", iq: 55, cost: 4, minutes: 10)
+        var high = costRow("gpt-g", "high", iq: 60, cost: 5, minutes: 10)
+        high.recommendedIn = ["daily_development"]   // 旧站长推荐豁免
+        let maxTier = costRow("gpt-g", "max", iq: 100, cost: 50, minutes: 10)
+        let groupG = ModelRecommendationGroup(modelName: "gpt-g", metricSource: .codexRadar,
+                                               tiers: [low, medium, high, maxTier])
+        guard case .recommended(let picked, _, _) = groupG.outcome, picked.id == maxTier.id else {
+            return XCTFail("expected 推荐 max（唯一进入 95% 门槛的候选）")
+        }
+
+        // 外部一档把组内全部四档都压制了：新推荐档、菜单栏档、旧站长推荐豁免档都受影响。
+        let cheapElsewhere = costRow("gpt-h", "ultra", iq: 100, cost: 1, minutes: 10)
+        let verdicts = CostEfficiency.verdicts(in: groupG.tiers + [cheapElsewhere])
+        for tier in groupG.tiers {
+            XCTAssertTrue(verdicts[tier.id]?.isDominated ?? false, "\(tier.id) 应被压制")
+        }
+
+        let filtered = ModelRecommendationFrontierFilter.visibleTiers(
+            in: groupG, verdicts: verdicts, menuBarID: medium.id, forceShowAll: false
+        )
+        // 新推荐档（max）/ 菜单栏档（medium）/ 旧站长推荐豁免（high）保留；无保护的 low 被过滤。
+        XCTAssertEqual(Set(filtered.map(\.id)), Set([maxTier.id, medium.id, high.id]))
+
+        let all = ModelRecommendationFrontierFilter.visibleTiers(
+            in: groupG, verdicts: verdicts, menuBarID: medium.id, forceShowAll: true
+        )
+        XCTAssertEqual(all.count, groupG.tiers.count, "「显示全部档位」按钮按下后应绕过过滤")
+    }
+
+    func testModelRecommendationFrontierFilter_doesNotAffectRecommendationOutcome() {
+        let medium = costRow("gpt-i", "medium", iq: 90, cost: 6, minutes: 20)
+        let high = costRow("gpt-i", "high", iq: 95, cost: 8, minutes: 20)
+        let group = ModelRecommendationGroup(modelName: "gpt-i", metricSource: .codexRadar, tiers: [medium, high])
+        let verdicts = CostEfficiency.verdicts(in: group.tiers)
+
+        _ = ModelRecommendationFrontierFilter.isGroupVisible(group, verdicts: verdicts, menuBarID: nil)
+        _ = ModelRecommendationFrontierFilter.visibleTiers(in: group, verdicts: verdicts, menuBarID: nil, forceShowAll: false)
+
+        guard case .recommended(let picked, _, _) = group.outcome else {
+            return XCTFail("过滤前后推荐结论都不应改变")
+        }
+        XCTAssertEqual(picked.id, high.id, "展示层过滤不改变推荐算法的判定结果")
+    }
+
     // MARK: - 性价比判定（组内比较：IQ 不更低 + 更便宜 + 不明显更慢）
 
     private func costRow(_ name: String, _ depth: String, iq: Double, cost: Double, minutes: Int) -> ScoredModel {
@@ -1288,6 +1408,42 @@ final class RadarParserTests: XCTestCase {
         XCTAssertEqual(result.map(\.id), recommended.map(\.id))
     }
 
+    // MARK: - DeepSeekDisplayLimit.limitedGroups：同一限额套用到「模型推荐」折叠分组（一组一个模型）
+
+    private func deepSeekGroup(_ name: String, recommendedIn: [String] = []) -> ModelRecommendationGroup {
+        let tier = ScoredModel(
+            result: ModelResult(name: name, depth: "high", iq: 90, passed: 7, tasks: 20, cost: 10, timeMinutes: 20, family: .codex, isReference: false),
+            score: 0.9, recommendedIn: recommendedIn
+        )
+        return ModelRecommendationGroup(modelName: name, metricSource: .codexRadar, tiers: [tier])
+    }
+
+    func testDeepSeekDisplayLimitGroups_capsAtThree_whenNoneRecommended() {
+        let groups = (0..<5).map { deepSeekGroup("deepseek-v\($0)") }
+        let result = DeepSeekDisplayLimit.limitedGroups(groups)
+        XCTAssertEqual(result.count, 3)
+        XCTAssertEqual(result.map(\.id), Array(groups.prefix(3)).map(\.id))
+    }
+
+    func testDeepSeekDisplayLimitGroups_recommendedGroupsProtected_thenTopUpToThree() {
+        let recommended = deepSeekGroup("deepseek-r", recommendedIn: ["日常开发"])
+        let rest = (0..<4).map { deepSeekGroup("deepseek-v\($0)") }
+        let result = DeepSeekDisplayLimit.limitedGroups([recommended] + rest)
+        XCTAssertEqual(result.count, 3)
+        XCTAssertEqual(result.first?.id, recommended.id)
+    }
+
+    func testDeepSeekDisplayLimitGroups_doesNotMergeDifferentModelsOrSources() {
+        // 同名但不同 metricSource：两条不同的组，limitedGroups 只砍数量、不合并身份。
+        let codexTier = ScoredModel(result: ModelResult(name: "deepseek-x", depth: "high", iq: 90, passed: 7, tasks: 20, cost: 10, timeMinutes: 20, family: .codex, isReference: false, metricSource: .codexRadar), score: 0.9)
+        let radarTier = ScoredModel(result: ModelResult(name: "deepseek-x", depth: "high", iq: 90, passed: 7, tasks: 20, cost: 10, timeMinutes: 20, family: .codex, isReference: false, metricSource: .claudeRadar), score: 0.9)
+        let codexGroup = ModelRecommendationGroup(modelName: "deepseek-x", metricSource: .codexRadar, tiers: [codexTier])
+        let radarGroup = ModelRecommendationGroup(modelName: "deepseek-x", metricSource: .claudeRadar, tiers: [radarTier])
+        let result = DeepSeekDisplayLimit.limitedGroups([codexGroup, radarGroup])
+        XCTAssertEqual(result.count, 2)
+        XCTAssertEqual(Set(result.map(\.id)), Set([codexGroup.id, radarGroup.id]))
+    }
+
     // MARK: - 展示投影管线整合：质量过滤 → 单档收敛 → DeepSeek 限额，作用于 codexGroupsByVendor
 
     func testCodexGroupsByVendor_terraLunaCondensedToSingleTierInDisplay() throws {
@@ -1412,5 +1568,186 @@ final class RadarParserTests: XCTestCase {
         XCTAssertNil(RadarParser.parseInsightsTimestamp(json: Data(insights.utf8)))
         let efficiency = #"{"schema": 99, "source_updated_at": "2026-07-26T09:00:00Z", "points": []}"#
         XCTAssertNil(RadarParser.parseEfficiencyTimestamp(json: Data(efficiency.utf8)))
+    }
+
+    // MARK: - 模型推荐（ModelRecommendation）：真实工程 IQ + 均价的同源同模型比较，
+    // 与综合分（RadarParser.score）、insights 场景推荐口径完全无关。
+
+    private func recTier(_ depth: String, iq: Double, cost: Double, source: MetricSource = .codexRadar) -> ScoredModel {
+        ScoredModel(result: ModelResult(
+            name: "test-model", depth: depth, iq: iq, passed: 0, tasks: 0,
+            cost: cost, timeMinutes: 0, family: .codex, isReference: false, metricSource: source
+        ), score: 0)
+    }
+
+    func testModelRecommendation_astra_cheaperMediumWinsWithinThreshold() {
+        // medium 108.62 的 95% = 103.189，medium 107.14 达标且更便宜 → 推荐 medium。
+        let medium = recTier("medium", iq: 107.14, cost: 2.238601)
+        let high = recTier("high", iq: 108.62, cost: 3.065359)
+        guard case .recommended(let picked, _, _) = ModelRecommendation.evaluate([medium, high]) else {
+            return XCTFail("expected .recommended")
+        }
+        XCTAssertEqual(picked.result.depth, "medium")
+    }
+
+    func testModelRecommendation_sol_belowThresholdMediumLosesDespiteCheaperPrice() {
+        // max 107.14 是最高分；medium 95.54 / 107.14 ≈ 89.2% < 95%，未达门槛，即便更便宜也不能选它。
+        let max = recTier("max", iq: 107.14, cost: 7.999297)
+        let medium = recTier("medium", iq: 95.54, cost: 2.92932)
+        guard case .recommended(let picked, let maxIQ, let threshold) = ModelRecommendation.evaluate([max, medium]) else {
+            return XCTFail("expected .recommended")
+        }
+        XCTAssertEqual(picked.result.depth, "max")
+        XCTAssertEqual(maxIQ, 107.14, accuracy: 1e-9)
+        XCTAssertEqual(threshold, 107.14 * 0.95, accuracy: 1e-9)
+    }
+
+    func testModelRecommendation_95PercentBoundary_isInclusive() {
+        // maxIQ = 100 → threshold = 95（Double 精确值）；iq 恰好等于门槛应被纳入候选。
+        let top = recTier("high", iq: 100, cost: 20)
+        let boundary = recTier("medium", iq: 95, cost: 5)
+        guard case .recommended(let picked, _, let threshold) = ModelRecommendation.evaluate([top, boundary]) else {
+            return XCTFail("expected .recommended")
+        }
+        XCTAssertEqual(threshold, 95, accuracy: 1e-9)
+        XCTAssertEqual(picked.result.depth, "medium", "达标（>=门槛）且更便宜，理应中选")
+    }
+
+    func testModelRecommendation_missingPriceAtHighestIQ_doesNotLowerThreshold() {
+        // 最高分档缺价格：若先剔除它再取最高分，门槛会从 95 虚降到 85.5，让本不该入选的 90 分档
+        // 误当候选。正确实现必须仍用 100 算门槛，令 90 分档落选，最终判定无可靠推荐。
+        let topNoPrice = recTier("high", iq: 100, cost: 0)
+        let belowRealThreshold = recTier("medium", iq: 90, cost: 5)
+        guard case .unavailable(.noValidPrice) = ModelRecommendation.evaluate([topNoPrice, belowRealThreshold]) else {
+            return XCTFail("expected .unavailable(.noValidPrice)")
+        }
+    }
+
+    func testModelRecommendation_nanZeroNegative_excludedFromComparison() {
+        let nanScore = recTier("a", iq: .nan, cost: 10)
+        let zeroScore = recTier("b", iq: 0, cost: 10)
+        let negativeScore = recTier("c", iq: -5, cost: 10)
+        let nanPrice = recTier("d", iq: 100, cost: .nan)
+        let zeroPrice = recTier("e", iq: 100, cost: 0)
+        let negativePrice = recTier("f", iq: 100, cost: -5)
+        let onlyValid = recTier("g", iq: 100, cost: 20)
+
+        let outcome = ModelRecommendation.evaluate([
+            nanScore, zeroScore, negativeScore, nanPrice, zeroPrice, negativePrice, onlyValid,
+        ])
+        guard case .recommended(let picked, let maxIQ, _) = outcome else {
+            return XCTFail("expected .recommended")
+        }
+        XCTAssertEqual(picked.result.depth, "g")
+        XCTAssertEqual(maxIQ, 100, accuracy: 1e-9, "NaN/0/负值不应参与最高分计算")
+    }
+
+    func testModelRecommendation_singleComparableTier_notTreatedAsReliableRecommendation() {
+        let only = recTier("high", iq: 90, cost: 10)
+        guard case .singleComparableTier(let picked) = ModelRecommendation.evaluate([only]) else {
+            return XCTFail("expected .singleComparableTier")
+        }
+        XCTAssertEqual(picked.result.depth, "high")
+    }
+
+    // MARK: - ModelRecommendationGroup.isExpandable：只看实际档位数，不看推荐结论
+
+    func testModelRecommendationGroup_singleTier_notExpandable() {
+        let group = ModelRecommendationGroup(modelName: "test-model", metricSource: .codexRadar, tiers: [recTier("high", iq: 90, cost: 10)])
+        guard case .singleComparableTier = group.outcome else { return XCTFail("expected .singleComparableTier") }
+        XCTAssertFalse(group.isExpandable, "只有一档时没有东西可展开")
+    }
+
+    func testModelRecommendationGroup_multipleTiersButSingleValidIQ_stillExpandable() {
+        // 两档，但第二档 IQ 无效（0），构不成「比较」，outcome 仍是 .singleComparableTier；
+        // 展开列表要展示的是全部原始档位（这里两档），不能因为 outcome 是单档结论就禁止展开。
+        let valid = recTier("high", iq: 90, cost: 10)
+        let invalid = recTier("medium", iq: 0, cost: 5)
+        let group = ModelRecommendationGroup(modelName: "test-model", metricSource: .codexRadar, tiers: [valid, invalid])
+        guard case .singleComparableTier = group.outcome else { return XCTFail("expected .singleComparableTier") }
+        XCTAssertEqual(group.tiers.count, 2)
+        XCTAssertTrue(group.isExpandable, "多档时即使推荐结论落成单档也应可展开")
+    }
+
+    func testModelRecommendationGroup_multipleValidTiers_recommendedAndExpandable() {
+        let a = recTier("high", iq: 100, cost: 10)
+        let b = recTier("medium", iq: 90, cost: 5)
+        let group = ModelRecommendationGroup(modelName: "test-model", metricSource: .codexRadar, tiers: [a, b])
+        guard case .recommended = group.outcome else { return XCTFail("expected .recommended") }
+        XCTAssertTrue(group.isExpandable)
+    }
+
+    func testModelRecommendation_noValidScore_returnsUnavailable() {
+        let all = [recTier("a", iq: 0, cost: 10), recTier("b", iq: -1, cost: 10), recTier("c", iq: .nan, cost: 10)]
+        guard case .unavailable(.noValidScore) = ModelRecommendation.evaluate(all) else {
+            return XCTFail("expected .unavailable(.noValidScore)")
+        }
+    }
+
+    func testModelRecommendation_tieBreak_isStableFirstOccurrence() {
+        // 两档同价且都达标（98/100 = 98% >= 95%），平局取调用方给定顺序里先出现的一档。
+        let a = recTier("a", iq: 100, cost: 10)
+        let b = recTier("b", iq: 98, cost: 10)
+
+        guard case .recommended(let firstOrderWinner, _, _) = ModelRecommendation.evaluate([a, b]) else {
+            return XCTFail("expected .recommended")
+        }
+        XCTAssertEqual(firstOrderWinner.result.depth, "a")
+
+        guard case .recommended(let reversedOrderWinner, _, _) = ModelRecommendation.evaluate([b, a]) else {
+            return XCTFail("expected .recommended")
+        }
+        XCTAssertEqual(reversedOrderWinner.result.depth, "b")
+    }
+
+    func testModelRecommendationGroup_expandedTiersSortedByDepthOrder() {
+        let tiers = [
+            recTier("ultra", iq: 100, cost: 10),
+            recTier("low", iq: 60, cost: 1),
+            recTier("weird", iq: 70, cost: 2),      // 未知档
+            recTier("xhigh", iq: 95, cost: 8),
+            recTier("high", iq: 90, cost: 5),
+            recTier("medium", iq: 80, cost: 3),
+            recTier("max", iq: 98, cost: 9),
+            recTier("another", iq: 65, cost: 1.5),  // 未知档，字典序排在 "weird" 之前
+        ]
+        let group = ModelRecommendationGroup(modelName: "test-model", metricSource: .codexRadar, tiers: tiers)
+        XCTAssertEqual(
+            group.tiers.map(\.result.depth),
+            ["low", "medium", "high", "xhigh", "max", "ultra", "another", "weird"]
+        )
+    }
+
+    func testGroupedForRecommendation_separatesSameModelNameAcrossMetricSources() throws {
+        // 同一模型名 "opus-5" 在 claudecoderadar（雷达）与 codexradar（竞品列）两个源都出现，
+        // 任务集与花费量级不同，绝不能合并到同一组比较（见 MetricSource 的注释）。
+        func tier(_ depth: String, iq: Double, cost: Double, source: MetricSource) -> ScoredModel {
+            ScoredModel(result: ModelResult(
+                name: "opus-5", depth: depth, iq: iq, passed: 0, tasks: 0,
+                cost: cost, timeMinutes: 0, family: .claude, isReference: false, metricSource: source
+            ), score: 0)
+        }
+        let models = [
+            tier("high", iq: 100, cost: 50, source: .claudeRadar),
+            tier("medium", iq: 90, cost: 10, source: .claudeRadar),   // 90/100 = 90% < 95%，落选
+            tier("high", iq: 80, cost: 5, source: .codexRadar),
+        ]
+
+        let groups = models.groupedForRecommendation()
+
+        XCTAssertEqual(groups.count, 2, "同模型名不同 metricSource 必须分开成组")
+        let claudeRadarGroup = try XCTUnwrap(groups.first { $0.metricSource == .claudeRadar })
+        let codexRadarGroup = try XCTUnwrap(groups.first { $0.metricSource == .codexRadar })
+        XCTAssertEqual(claudeRadarGroup.tiers.count, 2)
+        XCTAssertEqual(codexRadarGroup.tiers.count, 1)
+
+        guard case .recommended(let picked, _, _) = claudeRadarGroup.outcome else {
+            return XCTFail("claudeRadar 分组应有推荐结论")
+        }
+        XCTAssertEqual(picked.result.depth, "high")
+
+        guard case .singleComparableTier = codexRadarGroup.outcome else {
+            return XCTFail("codexRadar 分组只有一档，应为 singleComparableTier")
+        }
     }
 }
