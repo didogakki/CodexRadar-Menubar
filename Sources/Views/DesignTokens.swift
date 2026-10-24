@@ -63,6 +63,15 @@ enum DS {
         }
     }
 
+    /// 行内分数配色。Radar Bench 的 score 是 radar-bench-v2-150 新量纲，没有可套用的经验阈值，
+    /// 旧 100/90/80 的 IQ 阈值色不适用：完整覆盖用中性色，覆盖未完整（分数还会变）用橙色，缺失分数用灰色。
+    /// 旧量纲行（无 bench）沿用 iqColor。
+    static func scoreColor(_ model: ScoredModel) -> Color {
+        guard let bench = model.result.bench else { return iqColor(model.iq) }
+        if bench.score == nil { return sec(0.4) }
+        return bench.isComplete ? text92 : orange
+    }
+
     // 进度条 / hover
     static let barTrack = Color.white.opacity(0.07)
     static let rowHover = Color.white.opacity(0.05)

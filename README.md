@@ -1,8 +1,12 @@
 # CodexRadar
 
-> 非官方 macOS 菜单栏小工具：跟随 codexradar.com 的「站长推荐」与「智力效率」权威数据，菜单栏直接告诉你「服务端推荐的日常开发性价比档是哪一个」，并附来自 codexradar 竞品条目的 Claude Code 分区。
+> 非官方 macOS 菜单栏小工具：跟随 codexradar.com 现行的同基准 Radar Bench（`radar-bench-v2-150`，满分 150）逐档成绩，弹窗里按分数、API 等价费用、耗时列出各模型思考档，并在数据可靠时给出本地计算的性价比推荐。
 
 原生实现：`NSStatusItem` + `NSPopover`，弹窗用 `NSHostingController` 承载 SwiftUI。数据来自 [Codex 雷达](https://codexradar.com/) 的公开数据，仅做只读拉取。
+
+> **现场核对（2026-10-24）**：codexradar.com 绑定仍是 `radar-bench-final64-20261004` / `radar-bench-v2-150`（150 分、64 任务、34 档），逐档 summary 为 `v6-150-details`，应用无需再迁移。
+>
+> **数据迁移说明（2026-10-18）**：网站已切换到 Radar Bench 同基准评分，旧的 `radar-insights` / `intelligence-efficiency-metrics` 接口目前返回 502，`current.json` 里的 `model_iq` 停留在 2026-09-13 的旧量纲。本应用已不再请求这三个旧地址，旧 IQ 与新分数**绝不混用**；网站的「站长推荐」场景（日常开发 / 难题攻坚）因此暂时没有数据，应用里的「推荐」一律是本地计算，不是站长推荐。
 
 <p align="center">
   <img src="docs/screenshot.png" width="320" alt="CodexRadar 弹窗">
@@ -10,17 +14,17 @@
 
 ## 功能
 
-- **两种榜单模式**：默认「模型推荐」，按模型与指标来源折叠，汇总真实工程 IQ、均价等推荐依据，点击多档模型可展开各思考档；「完整榜单」保留全部档位和顶部场景推荐区。模式选择跨会话保存，刷新不会重置。
-- **菜单栏一眼看结论**：彩色圆点 + 服务端 `daily_development` 中首个 GPT 推荐项的紧凑名（如 `● 5.5·medium`），颜色按 IQ 阈值取色；insights 不可用时回退本地估算冠军。
-- **场景推荐区**：在「完整榜单」模式的弹窗顶部展示「日常开发」「难题攻坚」两个决策场景，每个场景两行（主推荐 + 备选），型号名不截断、价格与 IQ 右对齐成列。IQ 取 `comprehensive_points` 的综合 IQ —— 也就是推荐排序真正依据的那个值，避免出现「第一名的数字比第二名小」。后台自动化 / 跑龙虾类任务不进推荐区，仍以行内 chip 呈现。
-- **权威指标列表**：Codex 列表使用 intelligence-efficiency 的网站 IQ / 价格 / 时长 / 成本指数，一律按 IQ 降序（推荐项不置顶，结论已在顶部推荐区）；命中推荐的行带场景 chip，按场景配色（日常开发蓝 / 难题攻坚紫）且不折叠——一个档位同时命中两个场景是常态。进度条只是 IQ 视觉比例，不是自创总评分。
-- **性价比标记**：同一分组内、且同一数据源内比较——若组内存在另一档「IQ 不更低 + 花费更少 + 耗时不超过本档 1.1 倍」，本档即被判为被压制，价格标橙；组内无人能压制的档位价格标绿。被压制且花费达到参照档 2 倍以上时，行内再加一个 `×N` 角标（参照取所有压制者中最便宜的一档）。10% 耗时容差是为了避免「快 1 分钟」让一个贵一倍、IQ 还更低的档位逃脱标记。花费或耗时缺失的档位不参与判定，价格保持中性灰。判定仍按 `metricSource` 分桶、只在同源内比较，为未来可能重新引入的其它数据源预留兼容路径（见「Claude Code 分区数据来源」）。纯展示层结论，不改排序，也不影响菜单栏选型与场景推荐区。
-- **单行分区筛选**：`全部 | OpenAI | Claude Code | Grok | DeepSeek`。分区的顺序与内容都来自 `BoardSection.displayOrder` 这一份来源，筛选行与榜单共用，不会筛出空组；当前快照没有的分区不出现在筛选行里；筛选 chip 横向可滚，右端固定「只看前沿」开关（见下）。Codex 侧展示白名单即由它派生，白名单之外的厂商（Google / 智谱 / Moonshot / 腾讯 / 其他）整体隐藏，不影响 `snapshot.all` 等权威数据。codexradar 的 `claude-*` 竞品条目不进 Codex 榜单，而是并入 Claude Code 分区（见下）。
-- **「只看前沿」开关**：筛选行右端的橙色 chip（与分区筛选之间有竖线隔断——它管的是显示密度，不是第六个分区）。开启后隐藏被压制的行，选中态用橙色是因为它管的正是价格标橙的那批档位。判定始终基于**全量**组内数据：先过滤再判定会让基准漂移——压制者被隐藏后，被压制的行反而会翻身变成前沿。三类行不隐藏：未被压制的、缺花费或耗时因而没有判定的（价格中性灰，不算被压制）、以及推荐项与菜单栏当前档位——顶部场景推荐区固定展示后者，榜单里对应行消失会造成「上面推荐了、下面找不到」；这些豁免行改为淡化显示，表明它们本该被这个开关藏起来。组标题右侧标出隐藏条数（`IQ · 隐藏 6`）。名次配色沿用全量列表里的原始位次，切换开关不会让同一行改变颜色。每组至少留一行（组内最便宜的档位没有更便宜的能压制它，必为前沿），所以不会筛出空组。选择存入 `UserDefaults`，跨会话保持。
-- **展示层瘦身**：榜单只对「看到什么」做三道收敛，`snapshot.all` / `codexGroup` 等权威数据与菜单栏选型都不受影响——① **质量过滤**：样本数 < 20 或 IQ < 50 的候选不展示，同一模型内 IQ 低于自身最高档 60% 的思考档也不展示（推荐项、菜单栏档位、`gpt-*` 一律豁免，避免误伤权威推荐与菜单栏一致性）；② **单档收敛**：`gpt-5.6-terra` 与 `gpt-5.6-luna` 候选档位多，各只展示一档（菜单栏档位优先，否则取 IQ 最高档）；③ **DeepSeek 限额**：该分组最多 3 条，推荐项优先保留；「模型推荐」模式的 DeepSeek 折叠分组套用同一限额，两种模式条数一致（推荐判定本身仍用全量档位算，限额只砍展示的组数）。
-- **稳定数据源 + 分层回退**：新主源不可用时回退 `current.json` 本地估算（UI 明确标注「本地估算」）；Claude Code 分区数据随 Codex 主源一起抓取，取不到 `claude-*` 条目也不影响 Codex。
-- **轻量常驻**：无 Dock 图标，启动拉取 + 每 30 分钟轮询，`⌘R` 手动刷新、`⌘O` 打开网站。
-- **纯只读、不上传**：只请求三个公开地址，不读取任何本机敏感数据。
+- **两种榜单模式**：默认「模型推荐」，按模型折叠，展开可看各思考档；「完整榜单」按分数降序列出全部档位。模式选择跨会话保存，刷新不会重置。
+- **分数口径**：每行的「分」是 Radar Bench 的 score（满分取绑定里的 `score_max`，目前 150）。真实 0 分显示 `0.0`，尚无分数显示 `—`（两者不同）。覆盖不完整（`coverage < required_tasks` 或 `score_status` 不是 `complete`）的行带「暂定 43/64」/「待测」角标，分数用橙色提示还会变。旧的 100/90/80 阈值色不适用于新量纲：完整覆盖的分数一律中性色，不做好坏着色。
+- **费用与耗时**：费用是官方标准 **API 等价费用**（不是订阅扣费，也不是现金账单）。均值只由已知样本算：`known_total / known_samples`，缺失样本不当 0；样本不全时数值后加 `*`，悬停/无障碍文本给出「已知 79/80 样本均值」。没有费用或耗时样本的行省略该字段，不显示 `$0.00`。耗时均值取原始 `elapsed_ms` 已知样本均值，有效性过滤与性价比的 1.1 倍耗时判断都按秒级精度计算（不经分钟取整）；展示时不足 1 分钟显示秒数（如 `45s`），不会出现有效的 `0m`。
+- **本地推荐（非网站推荐）**：同一模型的全部绑定档位中，分数达最高档 95% 的候选里取 API 等价费用最低的一档。只在以下前提都满足时才给出，否则折叠行写明原因：① 绑定里该模型的所有档位都已成功读取；② 组内每档覆盖完整；③ 候选档位的费用样本齐全（有任一候选缺费用样本就不推荐，而不是猜）。行内标记为「本地推荐」，从不标成站长推荐。
+- **菜单栏**：只有当**整批**档位都读取成功、覆盖完整、且没有读取失败时，才显示分数最高的档位（如 `● 6.1-sol·low`，中性蓝色，不套旧阈值色）；否则（局部批次）若已有覆盖完整的 GPT 档，显示灰色 `◐` 标记的临时型号与进度（如 `◐ 6.1-sol·low 30/34`，仅是「已读取完整档中最高」，不是全榜冠军，也不是站长推荐），悬停提示写明已读取/完整档数量、读取失败与数据过旧情况；还没有任何覆盖完整的 GPT 档时只显示进度 `○ 0/34`；没有任何数据时显示 `—`。
+- **性价比标记与「只看前沿」**：仍在同一分组内比较——另一档「分数不低 + 费用更少 + 耗时不超过本档 1.1 倍」即压制本档（价格标橙，达 2 倍以上加 `×N` 角标），无人压制标绿。Radar Bench 行只有覆盖完整、费用与耗时样本都齐全的才参与判定，其余保持中性灰；判定始终基于全量数据，「只看前沿」开关与推荐项/菜单栏档位豁免规则不变，选择跨会话保存。
+- **单行分区筛选**：`全部 | OpenAI | Claude Code | Grok | DeepSeek`，分区与榜单共用 `BoardSection.displayOrder`，没有内容的分区自动隐藏。目前绑定只包含 `gpt-*`，所以只有 OpenAI 分区；Claude / Grok / DeepSeek 不会用旧量纲数据凭空补出来，网站以后在绑定里加入对应模型时会自动出现（`claude-*` 沿用既有的并入 Claude Code 分区逻辑）。
+- **读取状态可见**：头部分开显示「读取」（本地最近一次成功读取时间）与「评分」（接口 `detail_metrics.latest_graded_at` 给出的最近评分时间；接口没给就不显示，绝不拿当前时间顶替）。读取中显示进度 `读取中 12/34`；某些档位读取失败时头部写明数量，榜单里沿用旧结果的行带「缓存」角标，悬停可看成功读取时间和失败原因。
+- **固定操作始终可达**：打开仪表盘 `⌘O` / 立即刷新 `⌘R` / 退出在滚动区之外。滚动区上限 = 屏幕可用高度 − 实测的头部、模式与筛选条、底部操作区高度，头部提示变长或榜单很长时底部操作也不会被挤出屏幕；口径说明单独成行、可换行，窄窗下不挤占模式切换。
+- **轻量常驻**：无 Dock 图标；启动与每 30 分钟的后台轮询只读绑定并补读缺失/过期（≥ 3 小时）的档位，`⌘R` 手动刷新才重读全部档位，不会每次轮询都扫 34 个请求。
+- **纯只读、不上传**：只请求两个公开地址（见「隐私」），不读取任何本机敏感数据。
 
 ## 环境要求
 
@@ -50,59 +54,43 @@ Debug 构建会自动把弹窗各状态（正常 / 加载 / 错误）渲染到 `
 
 ## 数据来源
 
-应用在启动时拉取一次、之后每 30 分钟轮询一次，`⌘R` 可手动刷新。数据源按优先级分层：
+唯一数据源是 codexradar.com 的 Radar Bench（`radar-bench-v2-150`）：
 
-两个权威源（radar-insights / intelligence-efficiency-metrics）瞬时失败会让整段榜单降级，因此失败后会短暂退避重试一次，两次都失败才按不可用处理。
+- **绑定**：`GET https://codexradar.com/data/radar-bench-binding.json`。必须 `enabled` 且 `production_read_verified`；`benchmark`、`catalog_version`、`score_version` 非空，`task_set_sha256` 为 64 位十六进制，`score_max > 0`，`total_tasks > 0`，`source_counts`（若有）之和等于 `total_tasks`；`model_efforts` 去重后保持绑定顺序（上限 128 项）。校验不过就不读任何成绩，沿用 24 小时内的缓存榜单并在头部提示。绑定里的 `transport_origin` / `endpoint_path`（`api.codexradar.com`）不使用，实际走已验证的站点路径。
+- **逐档成绩**：`GET https://codexradar.com/api/radar-bench-score?model=…&effort=…&view=summary`，必须带 `X-Radar-Bench-Selection: user-selected-v1`（不带站点返回 428）。响应必须与绑定逐项一致：`schema`（`radar-bench-public-summary-*`）、`benchmark`、`catalog_version`、`task_set_sha256`、`score_version`、`score_max`、`required_tasks`、请求的 `model` / `effort`；`score` 为 `null` 或落在 `0…score_max`；`coverage` 在 `0…required_tasks`；`score_status == complete` 必须同时满足满覆盖且有分数；统计指标的 `known_samples + missing_samples` 必须等于 `sample_count`。任一不符整条拒绝，不降级采用。
+- **解析与保留**：分数、覆盖（`coverage/required_tasks`）、已评分运行数（`graded_runs_count`）、费用与耗时的已知/缺失样本分别建模；完整原始响应（含尚未建模的新增字段）原样保留并随缓存存取。
+- **请求策略**：评分请求去重后并发 ≤ 3（与站点自动队列一致）；站点繁忙（429 / 502 / 503 / 504、超时、连接中断）时单档最多尝试 3 次，等待遵循 `Retry-After`（秒数或 HTTP-date），没有时指数退避 2s、4s，单次等待上限 30 秒。任一请求遇到繁忙，其余 worker 的下一次请求也共享该冷却：每次真正发请求前（含已领取的档位和重试）都会重新检查取消、整批暂停与冷却，等待中冷却被其他 worker 延长时，醒来后继续遵守最新截止时间；整批被暂停后，已领取但尚未发送的档位与等待中的重试都不再发请求（已领取未发送计入「跳过」，已尝试过的计为失败，任务取消单独计数，进度统计闭合），已经在途的请求照常完成并合并。`Retry-After` 超过 30 秒、连续 3 个档位重试耗尽、或遇到 428，都会暂停整批（剩余档位不再请求），并进入冷却（有 `Retry-After` 就按它，否则 5 分钟），冷却期内拒绝后续刷新（手动刷新也一样）。
+- **观测缓存**：每个档位最近一次**成功**的原始响应 + 成功读取时间存入 `UserDefaults`（`radarBenchCache.v1`）。载入时每条都按当前绑定重新校验，只接受 24 小时内的；超过 24 小时的观测不展示、不参与推荐。绑定的 `benchmark` / `catalog_version` / `task_set_sha256` / 计分版本 / 满分 / 任务数任一变化，已有观测与缓存整体作废，不跨基准混用；基准不变时只剔除已不在绑定里的档位。
+- **时间**：「读取」= 本地时钟记录的成功读取时间；「评分」= 接口 `detail_metrics.latest_graded_at`（可带微秒，缺失则不显示）。两者独立存放、独立显示。
+- **不再使用的旧地址**：`radar-insights`、`intelligence-efficiency-metrics`（当前 502）与 `current.json`（`model_iq` 停在 2026-09-13，旧量纲）。`/api/model-ratings` 是社区评分，不是这个基准，也不使用。旧解析函数与测试仍保留在 `RadarParser` 中（现已无调用方），以便网站日后恢复旧接口时参考，但不参与现行数据流。
 
-- **站长推荐（权威源）**：`https://codexradar.com/api/radar-insights`，要求 `schema == 1`；`recommendations` 保持服务端数组顺序，每组含 `key`/`title`/`rule`/`items`，条目 identity 为 `model + effort`，字段含 `iq`/`passed`/`samples`/`average_cost_usd`/`average_duration_minutes`/`combined_cost_index`/`rule`/`trend_48h`。型号选择由它决定；菜单栏只接受 `daily_development` 中首个可匹配的 GPT 型号。
-- **智力效率（权威指标源）**：`https://codexradar.com/api/intelligence-efficiency-metrics`，兼容 `schema == 2/3`；`points` identity 为 `model + effort`，字段含 `iq`/`passed`/`valid_tasks`/`average_price_usd`/`average_minutes`/`combined_cost_index`，顶层带 `source_updated_at`。Codex 列表的 IQ / 价格 / 时长 / 成本指数均取自此源。`combined_cost_index` 是成本指标（越低越省），**绝不用作能力排序**。
-- **本地估算（完整失败回退）**：`https://codexradar.com/current.json` 的 `model_iq.latest` / `model_iq.comparisons`，仅当上述新主源不可用时才启用旧综合分公式，且 UI 明确标注「本地估算」；反之 `current.json` 失败不影响主数据。
-- **Claude Code 分区数据来源**：不再单独请求 claudecoderadar.com；分区数据完全来自 intelligence-efficiency-metrics 里 `claude-*` 前缀的竞品条目，跟 Codex 数据同一次抓取。解析层会去掉 `claude-` 前缀（`claude-opus-5` → `opus-5`）并入 Claude Code 分区——它们此前既不进 Codex 榜单也不进 Claude 组，导致 codexradar 独有的 `opus-5` 完全看不到；IQ 为 0 的档位与 `fable-*` 内部代号一律不展示。按 IQ 降序、按 maxIq 重算进度条比例。抓不到 `claude-*` 条目时 Claude Code 组提示「数据提取失败」或隐藏，不影响 Codex 本身；性价比橙/绿标记仍按 `metricSource` 分桶、只在同源内比较，为未来可能重新引入独立数据源留出兼容路径。
-- **检测时间戳**：优先取 insights / efficiency 的 `source_updated_at`，回退 `current.json` 的 `model_iq.quota_radar.updated_at`，再回退当前时间；按系统时区显示为 `YYYY-MM-DD HH:mm`，并实时展示「距今」。
-- **日常开发补算**：当网页接口返回的 `daily_development.items` 为空时，使用同一响应的 `comprehensive_points` 与实时效率指标，筛选综合 IQ ≥ 90 的 GPT 档位，按平均耗时、综合成本指数、综合 IQ 排序，取前两项；因此菜单栏会推荐网站截图中的 `Sol medium`。
-- **难题攻坚补算**：`hard_problems.items` 同样常年为空。按接口 `rule` 给出的规则复刻——有实测指标的 GPT 档位中按综合 IQ 从高到低取两项，IQ 相同再看模型顺序与综合成本；补算结果插在日常开发之后，保持服务端固有分组顺序。两组候选池互不排斥，同一档位可以同时带两个推荐标记。
+### 部分失败的处理规则
 
-> 主路径下 Codex 耗时来自 intelligence-efficiency 的 `average_minutes`；仅 `current.json` 本地回退时才采用其 `wall_seconds`（并发跑完的真实墙钟），与网页对比表的「总计算时长」口径不同。
+- 每个档位独立合并：成功的读取覆盖该档位；失败的读取只记录原因，**已有的成功行与它的读取时间原样保留**，不会因为一次部分失败让榜单变短或变空。
+- 本轮有任何档位读取失败时：菜单栏不声明榜首（显示灰色 `◐` 临时型号与进度，仅为已读取完整档中最高；无完整 GPT 档时显示 `○ n/N`），头部写明失败数量，沿用旧结果的行带「缓存」角标；行级「缓存」角标也会在成功读取超过 3 小时后出现。
+- 绑定读取失败（含 502）：不读成绩，24 小时内的缓存榜单继续显示；没有缓存则头部显示错误。
+- 没有任何有效观测时，榜单为空并显示错误，不会拿占位数据或 `Date()` 充数。
 
-### 部分成功降级规则
+## 已知限制
 
-- insights + efficiency 都成功：efficiency 提供指标，insights 决定推荐分组与菜单栏（`daily_development` 首个可匹配 GPT 项）；榜单一律按 IQ 降序，推荐项不置顶——结论已由顶部场景推荐区承担，命中的行只带场景 chip。`combined_cost_index` 不参与能力排序。
-- efficiency 失败（无论 insights 是否成功）：列表回退 `current.json` 本地估算的完整候选（UI 标注「本地估算」），站长推荐合并到匹配条目上（只写入场景 chip，不改变顺序）；推荐条目本身只有寥寥几条时不会把榜单塌缩成两三行。缺少效率指标时不进行日常开发补算。
-- efficiency 与 `current.json` 都失败、只剩 insights：最后兜底，从推荐条目自身指标构建去重 Codex 列表（保持分组/条目首次出现顺序，合并推荐场景）。
-- efficiency 成功、insights 失败：继续展示 efficiency 网站列表（按 IQ 降序）；菜单栏在 `current.json` 可用时按旧综合分得出的本地冠军 identity 匹配网站列表，不可用时回退网站列表第一项。本地公式不改变网站列表排序，也不标注为站长推荐。
-- 三者都失败：抛错，头部展示错误提示。
-- **不用更差的快照覆盖更好的**：`CodexDataSource` 三档按完整度排序（`website` > `localEstimate` > `recommendationsOnly`）。某次刷新只拿到更低一档时，`RadarViewModel` 保留上一次的好快照不覆盖，头部标出「未更新，展示上次结果」，上游恢复到同档或更高档才更新。这样一次瞬时故障不会把已经拿到的完整榜单换成两三条残缺列表。
-
-## 本地估算综合分（仅回退时使用）
-
-新主源不可用时才用旧公式作应急排序，四个维度几何加权（值越高越好），**按族各自归一化**——Codex 只和 Codex 比，Claude 只和 Claude 比：
-
-```
-maxIq   = 本族内最高 IQ
-minCost = 本族内最小费用
-minTime = 本族内最小耗时
-score   = (iq / maxIq)         ^ 0.42
-        × (min(passed,8) / 8)  ^ 0.13
-        × (minCost / cost)     ^ 0.30
-        × (minTime / time)     ^ 0.15
-```
-
-- 主路径（网站权威源）下进度条只是 IQ 视觉比例（`iq / 本组最高 IQ`），不展示任何自创总评分；上式综合分仅在「本地估算」标注下出现。
-- 分 `Codex` / `Claude Code` 两组：回退路径下 Codex 按上式综合分降序（推荐项同样不置顶，只带场景 chip）；Claude Code 不走此公式，任何路径下都按源 IQ 降序。组内名次决定行配色（第 1 绿、第 2 黄、第 3 橙、第 4 名及以后红）。
-- **两组不能横向比较**：Codex 与 Claude Code 均来自 codexradar.com 权威数据（不同接口/字段），各自成榜、互不影响。
+- 站长场景推荐（日常开发 / 难题攻坚）依赖旧 `radar-insights`，目前没有数据，相关视图自动隐藏。
+- 费用是 API 等价估算，不是订阅扣费；存在缺失样本的档位只有「已知样本均值」，且不参与性价比判定与本地推荐的候选比较。
+- 菜单栏榜首要求整批 34 档全部读取成功且覆盖完整；有档位仍是「暂定」或读取失败时只显示 `◐` 临时型号（不是冠军，提示里有说明），这是有意的保守选择；菜单栏当前显示的型号（榜首或临时型号）在完整榜单与模型推荐里始终可达，不会被「只看前沿」隐藏。
+- 读取到缓存的行最长可沿用 24 小时，沿用期间跨档位比较可能混有不同时刻的读取。
+- 弹窗的实际布局/交互需要在真机上手动验证；本仓库的自动化测试覆盖解析、取数、合并、缓存与推荐逻辑，不包含对弹窗的真实点击验证。
 
 ## 隐私
 
-只请求 `https://codexradar.com/api/radar-insights`、`https://codexradar.com/api/intelligence-efficiency-metrics` 与 `https://codexradar.com/current.json` 三个公开地址，只读拉取、不提交任何数据。系统时区仅用于本地格式化更新时间，不上传时区、定位或其他设备信息；不读取通讯录、日历、定位、照片或麦克风等敏感数据。
+只请求 `https://codexradar.com/data/radar-bench-binding.json` 与 `https://codexradar.com/api/radar-bench-score`（带 `model` / `effort` / `view=summary` 查询参数）两个公开地址，只读拉取、不提交任何数据，请求不携带 cookie。缓存只保存在本机 `UserDefaults`。系统时区仅用于本地格式化更新时间，不上传时区、定位或其他设备信息；不读取通讯录、日历、定位、照片或麦克风等敏感数据。
 
 ## 工程结构
 
 ```
 Sources/
 ├── App/        入口 + AppDelegate（状态栏 / 弹窗 / 轮询 / ⌘O·⌘R 快捷键）
-├── Model/      领域模型 + 解析（RadarParser：insights / efficiency 主源 + 回退综合分）+ JSON 解码（CurrentResponse 等）
-├── Service/    RadarService（insights + efficiency 主源，current.json 回退；Claude Code 分区随 efficiency 一并抓取，见 claude-* 竞品条目合并）
-├── ViewModel/  RadarViewModel（快照 / 加载 / 错误 / 相对时间 / 「只看前沿」开关）
+├── Model/      领域模型（Radar Bench 绑定 / 观测 / 推荐）+ 解析校验（RadarBenchParser）+ JSON 解码（JSONValue 保留未知字段；旧 CurrentResponse 等保留）
+├── Service/    RadarService（绑定 + 逐档成绩，并发 / 重试 / 冷却）+ RadarBenchStore（24h 观测缓存）
+├── ViewModel/  RadarViewModel（逐档合并 / 刷新触发 / 加载进度 / 相对时间 / 「只看前沿」与榜单模式偏好）
 ├── Views/      DesignTokens + 场景推荐区 + 分区筛选 + 榜单视图 + 头部 / 菜单栏 / 底部
 └── Support/    VisualEffectView（深色毛玻璃）
 Tests/

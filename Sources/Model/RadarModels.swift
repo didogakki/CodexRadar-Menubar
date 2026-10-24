@@ -352,14 +352,14 @@ enum CostEfficiency {
     }
 
     private static func verdictsWithinSource(_ group: [ScoredModel]) -> [String: CostVerdict] {
-        let comparable = group.filter { $0.result.cost > 0 && $0.result.timeMinutes > 0 }
+        let comparable = group.filter { $0.result.cost > 0 && $0.result.effectiveTimeSeconds > 0 && $0.isVerdictComparable }
         var result: [String: CostVerdict] = [:]
         for model in comparable {
             let cheapestDominator = comparable.filter { other in
                 other.id != model.id
                     && other.result.iq >= model.result.iq
                     && other.result.cost < model.result.cost
-                    && Double(other.result.timeMinutes) <= Double(model.result.timeMinutes) * timeTolerance
+                    && other.result.effectiveTimeSeconds <= model.result.effectiveTimeSeconds * timeTolerance
             }.min { $0.result.cost < $1.result.cost }
 
             guard let cheapestDominator else {
@@ -420,9 +420,19 @@ struct ModelResult {
     let isReference: Bool   // 参考性单日快照（Claude 参考列）
     /// 指标来自哪个站点（默认 codexradar；claudecoderadar 解析处显式传入）。
     var metricSource: MetricSource = .codexRadar
+    /// Radar Bench 观测（radar-bench-v2-150）。非 nil 时 `iq` 只是 score 的透传（缺失记 0），
+    /// 展示、配色、性价比与推荐一律按 `bench` 的 score/覆盖/样本口径处理，不再套用旧 IQ 量纲。
+    var bench: RadarBenchObservation? = nil
 
     /// 菜单栏候选只接受 GPT 型号；大小写归一后要求标准 `gpt-` 前缀。
     var isGPTModel: Bool { name.lowercased().hasPrefix("gpt-") }
+
+    /// 耗时（秒）。Radar Bench 行取原始 elapsed_ms 已知样本均值（保留秒级精度，不经分钟取整），
+    /// 缺失时回落到 `timeMinutes`；旧数据路径只有分钟精度。非正数 / 非有限 = 无有效耗时。
+    var effectiveTimeSeconds: Double {
+        let seconds = bench?.elapsed?.knownMean.map { $0 / 1000 } ?? Double(timeMinutes) * 60
+        return seconds.isFinite ? seconds : 0
+    }
 }
 
 /// 站长推荐条目（radar-insights，identity = model + effort）。
@@ -493,6 +503,7 @@ struct ScoredModel: Identifiable {
     let score: Double
     var recommendedIn: [String] = []   // 被哪些站长推荐分组选中（分组 title，服务端顺序）
     var costIndex: Double? = nil       // combined_cost_index（越低越省，仅展示）
+    var benchRead: BenchReadInfo? = nil   // Radar Bench 行的读取状态（成功读取时间 / 是否沿用缓存）
 
     var id: String { "\(result.name)/\(result.depth)" }
 
@@ -510,14 +521,30 @@ struct ScoredModel: Identifiable {
     /// 厂商分组（按模型名前缀派生，透传 result）。
     var vendor: ModelVendor { ModelVendor.from(modelName: result.name) }
 
-    /// IQ 数值文本（一位小数）："87.5"。
-    var iqLabel: String { String(format: "%.1f", result.iq) }
+    /// IQ 数值文本（一位小数）："87.5"。Radar Bench 行取 score：真实 0 显示 "0.0"，缺失显示 "—"。
+    var iqLabel: String {
+        if let bench = result.bench { return bench.score.map { String(format: "%.1f", $0) } ?? "—" }
+        return String(format: "%.1f", result.iq)
+    }
+
+    /// 分数列的小标题：旧量纲 "IQ"，Radar Bench 为 "分"（满分见 bench.scoreMax，不套用旧 100/90/80 档位）。
+    var scoreCaption: String { result.bench == nil ? "IQ" : "分" }
+
+    /// 性价比判定只纳入口径完整的行：Radar Bench 行必须覆盖完整、有分数、费用与耗时样本都齐全，
+    /// 否则「已知样本均值」互相比较会得出不可靠的压制关系。旧量纲行沿用 cost/time > 0 的判定。
+    var isVerdictComparable: Bool {
+        guard let bench = result.bench else { return true }
+        return bench.isComplete && (bench.apiEquivalentUSD?.isComplete ?? false) && (bench.elapsed?.isComplete ?? false)
+    }
 
     /// "7/12"。
     var passLabel: String { "\(result.passed)/\(result.tasks)" }
 
-    /// "$23.9"（保留一位小数）。
-    var costLabel: String { String(format: "$%.1f", result.cost) }
+    /// "$23.9"（保留一位小数）；Radar Bench 行单档费用常在 $1 以下，10 以内保留两位。
+    var costLabel: String {
+        if result.bench != nil, result.cost < 10 { return String(format: "$%.2f", result.cost) }
+        return String(format: "$%.1f", result.cost)
+    }
 
     /// "1h25m" / "28m"。
     var timeLabel: String {
@@ -527,11 +554,41 @@ struct ScoredModel: Identifiable {
         return "\(m)m"
     }
 
-    /// 有效价格标签（非正数不伪装为 $0.0，逐字段省略）。
-    var validCostLabel: String? { result.cost > 0 ? costLabel : nil }
+    /// 有效价格标签（非正数不伪装为 $0.0，逐字段省略）。Radar Bench 行为「已知样本」均值，
+    /// 样本不全时加 "*"（详情见 benchCostNote）。
+    var validCostLabel: String? {
+        guard result.cost > 0 else { return nil }
+        return costLabel + (isBenchCostPartial ? "*" : "")
+    }
 
-    /// 有效耗时标签（非正数不伪装为 0m，逐字段省略）。
-    var validTimeLabel: String? { result.timeMinutes > 0 ? timeLabel : nil }
+    /// 有效耗时标签（非正数不伪装为 0m，逐字段省略）；Radar Bench 样本不全时同样加 "*"。
+    /// 不足 1 分钟显示秒数（"45s"），否则同 `timeLabel` 的时分格式。
+    var validTimeLabel: String? {
+        let seconds = result.effectiveTimeSeconds
+        guard seconds > 0 else { return nil }
+        return Self.durationLabel(seconds: seconds) + (isBenchTimePartial ? "*" : "")
+    }
+
+    static func durationLabel(seconds: Double) -> String {
+        let wholeSeconds = Int(seconds.rounded())
+        if wholeSeconds < 60 { return "\(max(wholeSeconds, 1))s" }
+        let totalMinutes = Int((seconds / 60).rounded())
+        let h = totalMinutes / 60
+        let m = totalMinutes % 60
+        if h > 0 { return m > 0 ? "\(h)h\(m)m" : "\(h)h" }
+        return "\(m)m"
+    }
+
+    var isBenchCostPartial: Bool { result.bench?.apiEquivalentUSD.map { !$0.isComplete } ?? false }
+    var isBenchTimePartial: Bool { result.bench?.elapsed.map { !$0.isComplete } ?? false }
+
+    /// 费用口径说明（仅 Radar Bench 行）："API 等价费用，已知 79/80 样本均值"。
+    /// 明确是官方标准 API 等价费用，不是订阅扣费。
+    var benchCostNote: String? {
+        guard let metric = result.bench?.apiEquivalentUSD, metric.knownSamples > 0 else { return nil }
+        let base = "API 等价费用（非订阅扣费）"
+        return metric.isComplete ? base : "\(base)，已知 \(metric.knownSamples)/\(metric.totalSamples) 样本均值"
+    }
 
     /// 成本指数紧凑格式（3 位有效数字，兼顾 0.0002～100 量级；缺失/非正数省略）。
     var costIndexLabel: String? {
@@ -561,6 +618,10 @@ struct RadarSnapshot {
     var insights: [InsightGroup] = []      // 站长推荐分组（服务端顺序；本地估算回退时为空）
     var codexSource: CodexDataSource = .localEstimate   // Codex 数据来自网站权威源还是本地估算
     var localBestID: String? = nil   // current.json 本地冠军 identity（efficiency-only 时菜单栏独立回退用）
+    /// Radar Bench 上下文（绑定 + 逐档读取状态）。非 nil 时本快照是 radar-bench-v2-150 口径：
+    /// `updatedAt` 是最近一次**成功读取**时间（不是评分时间，评分时间见 benchmark.latestGradedAt），
+    /// 展示层质量过滤、旧 IQ 配色与站长推荐/本地估算回退全部不适用。
+    var benchmark: RadarBenchContext? = nil
 
     /// Codex 组（保持解析层给定的展示顺序）。
     var codexGroup: [ScoredModel] { all.filter { $0.result.family == .codex } }
@@ -574,6 +635,8 @@ struct RadarSnapshot {
     /// 不影响 all / codexGroup / menuBarBest 等权威数据与菜单栏逻辑。
     private var codexDisplayGroup: [ScoredModel] {
         let withoutAnthropic = codexGroup.filter { !ModelVendor.isAnthropicCompetitor(modelName: $0.result.name) }
+        // Radar Bench 全部档位同口径、同任务集，旧的样本数/IQ 下限与单档收敛不适用（会把低分档或 luna 的其它档藏掉）。
+        if benchmark != nil { return withoutAnthropic }
         let qualityFiltered = CodexDisplayQuality.filtered(withoutAnthropic, menuBarBestID: menuBarBest?.id)
         return CodexSingleTierCondense.filtered(qualityFiltered, menuBarBestID: menuBarBest?.id)
     }
@@ -624,9 +687,9 @@ struct RadarSnapshot {
                 !ModelVendor.isAnthropicCompetitor(modelName: $0.result.name)
                     && ModelVendor.from(modelName: $0.result.name) == vendor
             }
-            groups = pool.groupedForRecommendation()
+            groups = pool.groupedForRecommendation(expectedTiers: expectedTierCounts)
         case .claude:
-            groups = claudeDisplayGroup.groupedForRecommendation()
+            groups = claudeDisplayGroup.groupedForRecommendation(expectedTiers: expectedTierCounts)
         }
         // codexSource != .website：Codex 侧这一轮拿到的是 current.json 本地估算公式分
         // （.localEstimate）或只剩站长推荐条目（.recommendationsOnly），都不是网站权威的真实
@@ -649,8 +712,24 @@ struct RadarSnapshot {
         return reliabilityAdjusted
     }
 
+    /// Radar Bench：绑定里每个模型应有的档位数（推荐必须看齐全部档位，缺档不能冒充「该模型最高档」）。
+    private var expectedTierCounts: [String: Int] {
+        guard let benchmark else { return [:] }
+        // claude-* 并入 Claude Code 分区时会去掉前缀（见 mergeAnthropicIntoClaude），期望档位数按同名登记。
+        return Dictionary(grouping: benchmark.binding.selections) { selection in
+            ModelVendor.isAnthropicCompetitor(modelName: selection.model)
+                ? String(selection.model.dropFirst("claude-".count)) : selection.model
+        }.mapValues(\.count)
+    }
+
     /// 菜单栏只推荐 GPT 型号：daily_development 首个可匹配 GPT → 本地 GPT 冠军 → 第一个 GPT。
+    /// Radar Bench 快照没有站长推荐：只有**整批读取完整**时才给出分数最高的档位（榜首），
+    /// 部分批次不声明榜首（见 RadarBenchContext.championID）。
     var menuBarBest: ScoredModel? {
+        if let benchmark {
+            guard let championID = benchmark.championID else { return nil }
+            return codexGroup.first { $0.id == championID }
+        }
         let gptCandidates = codexGroup.filter { $0.result.isGPTModel }
         if let daily = insights.first(where: { $0.key == "daily_development" }),
            let matched = daily.items.lazy.compactMap({ pick in
@@ -667,13 +746,28 @@ struct RadarSnapshot {
         return gptCandidates.first
     }
 
-    /// 绝对检测时间戳："2026-06-25 14:28"（本地时区）。
-    var checkedAtLabel: String {
+    /// Radar Bench 部分批次的菜单栏临时型号（见 RadarBenchContext.provisionalLeaderID）；有榜首或无完整档时为 nil。
+    var provisionalMenuBarBest: ScoredModel? {
+        guard menuBarBest == nil, let id = benchmark?.provisionalLeaderID else { return nil }
+        return codexGroup.first { $0.id == id }
+    }
+
+    /// 菜单栏实际展示的型号 id：全榜榜首，否则局部批次的临时领先者。展示层「可达性保护」统一用它，
+    /// 保证菜单栏里看到的型号在完整榜单与模型推荐里都能找到（即使被前沿过滤判为被压制）。
+    var menuBarDisplayedID: String? { (menuBarBest ?? provisionalMenuBarBest)?.id }
+
+    /// 绝对检测时间戳："2026-06-25 14:28"（本地时区）。Radar Bench 快照中它是最近一次成功读取时间。
+    var checkedAtLabel: String { Self.absoluteLabel(updatedAt) }
+
+    /// 最新评分时间（来自接口 detail_metrics.latest_graded_at；接口没给就没有，绝不拿读取时间或 Date() 冒充）。
+    var gradedAtLabel: String? { benchmark?.latestGradedAt.map(Self.absoluteLabel) }
+
+    static func absoluteLabel(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = .autoupdatingCurrent
         formatter.dateFormat = "yyyy-MM-dd HH:mm"
-        return formatter.string(from: updatedAt)
+        return formatter.string(from: date)
     }
 }
 
@@ -710,6 +804,13 @@ enum ModelRecommendationOutcome {
         /// RadarSnapshot.recommendationGroups）。claudeRadar 指标不受此约束——它由
         /// claudeStatus 独立管控，与 Codex 侧的抓取状态无关。
         case unreliableCodexSource
+        /// Radar Bench：该模型绑定的部分思考档尚无成功读取（缺档会让「最高档」和 95% 门槛失真）。
+        case missingTiers
+        /// Radar Bench：组内有档位覆盖不完整（coverage < required_tasks 或 score_status 非 complete），
+        /// 不同覆盖的分数不可比。
+        case incompleteCoverage
+        /// Radar Bench：达到 95% 门槛的候选里有档位 API 等价费用样本不全，无法可靠比较「最低费用」。
+        case incompleteCost
     }
 
     case recommended(ScoredModel, maxIQ: Double, thresholdIQ: Double)
@@ -746,7 +847,11 @@ enum ModelRecommendationOutcome {
 enum ModelRecommendation {
     static let iqRetentionRatio = 0.95
 
-    static func evaluate(_ tiers: [ScoredModel]) -> ModelRecommendationOutcome {
+    /// - Parameter expectedTierCount: Radar Bench 绑定里该模型应有的档位数；少于它说明有档位尚未读到。
+    static func evaluate(_ tiers: [ScoredModel], expectedTierCount: Int? = nil) -> ModelRecommendationOutcome {
+        if tiers.contains(where: { $0.result.bench != nil }) {
+            return evaluateBenchmark(tiers, expectedTierCount: expectedTierCount)
+        }
         let validScore = tiers.filter { $0.result.iq.isFinite && $0.result.iq > 0 }
         guard !validScore.isEmpty else { return .unavailable(.noValidScore) }
         guard validScore.count >= 2 else { return .singleComparableTier(validScore[0]) }
@@ -763,6 +868,37 @@ enum ModelRecommendation {
             best = candidate
         }
         return .recommended(best, maxIQ: maxIQ, thresholdIQ: threshold)
+    }
+
+    /// Radar Bench 口径（本地计算，不是网站推荐）：同一基准、同一模型的全部绑定档位里，
+    /// score 达最高档 95% 的候选中取 API 等价费用最低者。可靠性前提，任一不满足都给出明确原因而不是硬推荐：
+    /// 1. 绑定的全部档位都已成功读取（expectedTierCount）；
+    /// 2. 组内每档覆盖完整（score_status == complete 且 coverage == required_tasks）；
+    /// 3. 候选档位的费用样本完整（known_samples > 0 且 missing_samples == 0）。
+    /// score 缺失（nil）不是 0：它不构成有效成绩；真实 0 分是有效成绩，但最高分为 0 时无从比较。
+    private static func evaluateBenchmark(_ tiers: [ScoredModel], expectedTierCount: Int?) -> ModelRecommendationOutcome {
+        let scored = tiers.filter { $0.result.bench?.score != nil }
+        guard !scored.isEmpty else { return .unavailable(.noValidScore) }
+        if let expectedTierCount, tiers.count < expectedTierCount { return .unavailable(.missingTiers) }
+        guard tiers.allSatisfy({ $0.result.bench?.isComplete ?? false }) else { return .unavailable(.incompleteCoverage) }
+        guard scored.count >= 2 else { return .singleComparableTier(scored[0]) }
+
+        let maxScore = scored.compactMap { $0.result.bench?.score }.max()!
+        guard maxScore > 0 else { return .unavailable(.noValidScore) }
+        let threshold = maxScore * iqRetentionRatio
+        let candidates = scored.filter { ($0.result.bench?.score ?? -1) >= threshold }
+        guard candidates.allSatisfy({ $0.result.bench?.apiEquivalentUSD?.isComplete ?? false }) else {
+            return .unavailable(.incompleteCost)
+        }
+        guard candidates.allSatisfy({ $0.result.cost.isFinite && $0.result.cost > 0 }) else {
+            return .unavailable(.noValidPrice)
+        }
+
+        var best = candidates[0]
+        for candidate in candidates.dropFirst() where candidate.result.cost < best.result.cost {
+            best = candidate
+        }
+        return .recommended(best, maxIQ: maxScore, thresholdIQ: threshold)
     }
 }
 
@@ -784,12 +920,12 @@ struct ModelRecommendationGroup: Identifiable {
     /// 与"是否参与过推荐比较"无关；真正的单档（tiers.count <= 1）才没有东西可展开。
     var isExpandable: Bool { tiers.count > 1 }
 
-    init(modelName: String, metricSource: MetricSource, tiers: [ScoredModel]) {
+    init(modelName: String, metricSource: MetricSource, tiers: [ScoredModel], expectedTierCount: Int? = nil) {
         self.modelName = modelName
         self.metricSource = metricSource
         // 推荐判定用调用方传入的原始顺序（见 ModelRecommendation.evaluate 的平局规则），
         // 展开列表另外按思考档排序展示，两者互不干扰。
-        self.outcome = ModelRecommendation.evaluate(tiers)
+        self.outcome = ModelRecommendation.evaluate(tiers, expectedTierCount: expectedTierCount)
         self.tiers = tiers.sorted { DepthTier.sortKey($0.result.depth) < DepthTier.sortKey($1.result.depth) }
     }
 
@@ -805,7 +941,8 @@ struct ModelRecommendationGroup: Identifiable {
 extension Array where Element == ScoredModel {
     /// 按「模型名 + 指标来源」分组，不跨源合并（同名不同站点口径不可比，见 MetricSource）；
     /// 分组顺序与组内档位顺序都保持首次出现的原始顺序。
-    func groupedForRecommendation() -> [ModelRecommendationGroup] {
+    /// `expectedTiers`：Radar Bench 绑定里各模型名应有的档位数（默认空 = 不校验）。
+    func groupedForRecommendation(expectedTiers: [String: Int] = [:]) -> [ModelRecommendationGroup] {
         var order: [String] = []
         var names: [String: String] = [:]
         var sources: [String: MetricSource] = [:]
@@ -823,7 +960,167 @@ extension Array where Element == ScoredModel {
 
         return order.compactMap { key in
             guard let name = names[key], let source = sources[key], let tiers = tiersByKey[key] else { return nil }
-            return ModelRecommendationGroup(modelName: name, metricSource: source, tiers: tiers)
+            return ModelRecommendationGroup(
+                modelName: name, metricSource: source, tiers: tiers, expectedTierCount: expectedTiers[name]
+            )
         }
+    }
+}
+
+// MARK: - Radar Bench（radar-bench-v2-150，网站现行同基准逐档成绩）
+//
+// 与旧 IQ 量纲（current.json model_iq / insights / efficiency）完全隔离：score 满分取绑定里的
+// score_max（目前 150），旧的 100/90/80 阈值色、50 分下限、站长推荐都不适用，也绝不混用。
+
+/// 绑定里的一个「模型 + 思考档」选择（读取成绩的最小单位）。
+struct BenchSelection: Hashable, Codable {
+    let model: String
+    let effort: String
+
+    var id: String { "\(model)/\(effort)" }
+}
+
+/// /data/radar-bench-binding.json 校验后的结果。identity = benchmark + catalog + task_set_sha256 + 计分版本，
+/// 任何一项变化都视为新基准：已有观测与缓存整体作废，不跨基准混用。
+struct RadarBenchBinding: Codable, Equatable {
+    let benchmark: String
+    let catalogVersion: String
+    let taskSetSHA256: String
+    let scoreVersion: String
+    let scoreMax: Double
+    let totalTasks: Int
+    let selections: [BenchSelection]   // 已去重，保持绑定顺序
+
+    var identityKey: String {
+        [benchmark, catalogVersion, taskSetSHA256, scoreVersion, String(scoreMax), String(totalTasks)]
+            .joined(separator: "|")
+    }
+
+    func isSameBenchmark(as other: RadarBenchBinding) -> Bool { identityKey == other.identityKey }
+}
+
+/// statistics.metrics.* 的一项（耗时 / API 等价费用）。均值只由 known_total / known_samples 得出，
+/// 绝不采信接口自带的 mean/total（样本缺失时它们是 null），缺失样本也不当 0 参与。
+struct RadarBenchMetric: Equatable {
+    let knownTotal: Double?
+    let knownSamples: Int
+    let missingSamples: Int
+    let missingReason: String?
+
+    var totalSamples: Int { knownSamples + missingSamples }
+    /// 样本齐全：至少有一个已知样本且没有缺失样本。
+    var isComplete: Bool { missingSamples == 0 && knownSamples > 0 && knownTotal != nil }
+    /// 已知样本均值；没有已知样本时为 nil（不是 0）。
+    var knownMean: Double? {
+        guard knownSamples > 0, let knownTotal else { return nil }
+        return knownTotal / Double(knownSamples)
+    }
+}
+
+/// 一次成功读取并通过校验的逐档成绩。`raw` 保留完整原始响应，未知的新字段随之保留（缓存也存它）。
+struct RadarBenchObservation: Equatable {
+    let selection: BenchSelection
+    let schema: String
+    let benchmark: String
+    let catalogVersion: String
+    let taskSetSHA256: String
+    let scoreVersion: String
+    let scoreMax: Double
+    /// nil = 尚无成绩（缺失）；0 是真实的 0 分。两者不可互换。
+    let score: Double?
+    let scoreStatus: String
+    let coverage: Int
+    let requiredTasks: Int
+    let gradedRunsCount: Int
+    let sampleCount: Int?
+    let costBasis: String?
+    let elapsed: RadarBenchMetric?
+    let apiEquivalentUSD: RadarBenchMetric?
+    /// 来源侧最近一次评分时间（detail_metrics.latest_graded_at）；与本地「成功读取时间」是两回事。
+    let latestGradedAt: Date?
+    /// 来源侧统计截止时间（detail_metrics.as_of）。
+    let sourceAsOf: Date?
+    let raw: JSONValue
+
+    /// 评分覆盖完整且有分数：只有它的 score 才可与其它完整档位比较。
+    var isComplete: Bool { scoreStatus == "complete" && coverage == requiredTasks && score != nil }
+}
+
+/// 单个档位的读取状态：最近一次成功观测 + 它的成功读取时间 + 最近一次尝试的失败原因。
+struct RadarBenchEntry: Equatable {
+    var observation: RadarBenchObservation?
+    var fetchedAt: Date?       // 成功读取时间（本地时钟），不是评分时间
+    var lastError: String?     // 最近一次尝试失败原因；下一次成功后清空
+}
+
+/// 行级读取状态（随 ScoredModel 传给视图）。
+struct BenchReadInfo: Equatable {
+    let fetchedAt: Date
+    /// 沿用缓存：最近一次尝试失败，或成功读取已超过 staleAfter。
+    let isStale: Bool
+    let lastError: String?
+}
+
+enum RadarBenchPolicy {
+    /// 观测与缓存的最大年龄；超过即作废，不展示、不参与推荐。
+    static let maxCacheAge: TimeInterval = 24 * 3600
+    /// 行级「沿用缓存」标记阈值，同时是后台轮询重新读取某一档的最小间隔（避免每次轮询扫 34 个请求）。
+    static let staleAfter: TimeInterval = 3 * 3600
+    /// 手动刷新时单档最小重读间隔（站点 x-radar-bench-ttl 为 60s）。
+    static let manualMinInterval: TimeInterval = 60
+    /// 与站点自动队列一致的并发上限。
+    static let concurrency = 3
+    /// 单档最多尝试次数（首次 + 重试）。
+    static let maxAttempts = 3
+    /// 单次等待（Retry-After / 退避）上限；Retry-After 超过它就不在本轮等待，直接暂停整批。
+    static let maxWait: TimeInterval = 30
+    /// 连续这么多个档位重试耗尽仍繁忙，就暂停整批（与站点 maxConsecutiveBusyFailures 同思路）。
+    static let maxConsecutiveBusyFailures = 3
+    static let maxSelections = 128
+}
+
+/// 快照里的 Radar Bench 上下文。`entries` 只含年龄 ≤ maxCacheAge 的观测（过期的已被剔除）。
+struct RadarBenchContext {
+    let binding: RadarBenchBinding
+    let entries: [String: RadarBenchEntry]   // key = BenchSelection.id
+
+    var expectedCount: Int { binding.selections.count }
+    var observedCount: Int { entries.values.filter { $0.observation != nil }.count }
+    var completeCount: Int { entries.values.filter { $0.observation?.isComplete == true }.count }
+    var failedCount: Int { entries.values.filter { $0.lastError != nil }.count }
+
+    /// 最近一次成功读取时间。
+    var latestReadAt: Date? { entries.values.compactMap { $0.observation == nil ? nil : $0.fetchedAt }.max() }
+    /// 来源侧最近一次评分时间（各档 latest_graded_at 的最大值）。
+    var latestGradedAt: Date? { entries.values.compactMap { $0.observation?.latestGradedAt }.max() }
+
+    /// 整批读取完整：每个绑定档位都有有效观测且覆盖完整，并且没有任何档位的最近一次读取失败。
+    var isCompleteBatch: Bool {
+        expectedCount > 0 && observedCount == expectedCount
+            && completeCount == expectedCount && failedCount == 0
+    }
+
+    /// 全局榜首：仅整批完整时给出分数最高的档位（并列取绑定顺序靠前者）。部分批次不声明榜首。
+    var championID: String? {
+        guard isCompleteBatch else { return nil }
+        var best: (id: String, score: Double)?
+        for selection in binding.selections {
+            guard let score = entries[selection.id]?.observation?.score else { continue }
+            if best == nil || score > best!.score { best = (selection.id, score) }
+        }
+        return best?.id
+    }
+
+    /// 批次未完整时的临时领先者：已成功读取且**覆盖完整**的 GPT 档位里分数最高者（并列取绑定顺序靠前者）。
+    /// 只是「已读取完整档中最高」，不是全榜冠军；整批完整后恒为 nil，由 championID 接管。
+    var provisionalLeaderID: String? {
+        guard !isCompleteBatch else { return nil }
+        var best: (id: String, score: Double)?
+        for selection in binding.selections where selection.model.lowercased().hasPrefix("gpt-") {
+            guard let observation = entries[selection.id]?.observation, observation.isComplete,
+                  let score = observation.score else { continue }
+            if best == nil || score > best!.score { best = (selection.id, score) }
+        }
+        return best?.id
     }
 }

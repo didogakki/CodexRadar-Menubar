@@ -1,140 +1,398 @@
-// 拉取并解析数据：
-// - radar-insights（站长推荐，权威源）+ intelligence-efficiency-metrics（智力效率，权威指标源）为 Codex 主数据；
-// - current.json 只保留为完整失败回退（本地估算），主源可用时其失败不致命；
-// - Claude Code 分区不再单独请求 claudecoderadar.com，完全来自 intelligence-efficiency-metrics 里的
-//   claude-* 竞品条目（见 RadarParser.mergeAnthropicIntoClaude），跟 Codex 数据同一次抓取。
+// 拉取并解析数据（codexradar.com 同基准 Radar Bench，radar-bench-v2-150）：
+// - /data/radar-bench-binding.json：基准身份（benchmark / task_set_sha256 / 计分版本）与可读取的「模型 + 档位」；
+// - /api/radar-bench-score?model=&effort=&view=summary：逐档读取成绩，必须带 X-Radar-Bench-Selection: user-selected-v1
+//   （不带返回 428），与网站自动队列同样的并发上限 3，繁忙（429/502/503/504、超时）按 Retry-After 有限次重试。
+// 旧的 radar-insights / intelligence-efficiency-metrics / current.json（IQ 量纲）不再请求：
+// 它们与新分数不同量纲，且前两者目前 502，绝不与新数据混用。
 import Foundation
 
 enum RadarServiceError: LocalizedError {
     case http(Int)
     case network(String)
     case decode(String)
+    /// 站点繁忙：429 / 502 / 503 / 504（status 非 nil），或超时、连接中断（status 为 nil）。可重试。
+    case busy(status: Int?, retryAfter: TimeInterval?)
 
     var errorDescription: String? {
         switch self {
-        case .http(let code): return "服务器返回 \(code)"
+        case .http(let code):
+            return code == 428 ? "站点要求选择请求头（428）" : "服务器返回 \(code)"
         case .network(let msg): return msg
         case .decode(let msg): return msg
+        case .busy(let status, _): return status.map { "服务繁忙（\($0)）" } ?? "请求超时或连接中断"
         }
     }
 }
 
+/// 一批逐档读取的汇总。
+struct RadarBenchBatchOutcome: Equatable {
+    var succeeded = 0
+    var failed = 0
+    /// 因整批被暂停而从未发起请求的档位数（含已领取但发送前被叫停的）。
+    var skipped = 0
+    /// 任务被取消而未完成的档位数；succeeded + failed + skipped + cancelled = 去重后的档位数。
+    var cancelled = 0
+    /// 整批被暂停的原因（站点繁忙 / 被拒绝）；nil = 正常跑完。
+    var stopReason: String?
+    /// 暂停原因是 Retry-After 过长时，建议多久后再试（秒）。
+    var retryAfter: TimeInterval?
+}
+
 struct RadarService {
-    let jsonURL = URL(string: "https://codexradar.com/current.json")!
-    // 与 codexradar.com 网页使用同源实时接口，避免旧子域/静态快照导致推荐不一致。
-    let insightsURL = URL(string: "https://codexradar.com/api/radar-insights")!
-    let efficiencyURL = URL(string: "https://codexradar.com/api/intelligence-efficiency-metrics")!
+    let bindingURL = URL(string: "https://codexradar.com/data/radar-bench-binding.json")!
+    let scoreEndpoint = URL(string: "https://codexradar.com/api/radar-bench-score")!
 
-    func fetch() async throws -> RadarSnapshot {
-        // 并发拉取三源：insights + efficiency 是 Codex 权威主源；current.json 仅回退。
-        async let insightsData = dataRetryingOnce(from: insightsURL, timeout: 10)
-        async let efficiencyData = dataRetryingOnce(from: efficiencyURL, timeout: 10)
-        async let jsonData = try? data(from: jsonURL, timeout: 10)
+    static let selectionHeaderField = "X-Radar-Bench-Selection"
+    static let selectionHeaderValue = "user-selected-v1"
+    static let requestTimeout: TimeInterval = 15
 
-        let insightsRaw = await insightsData
-        let efficiencyRaw = await efficiencyData
-        let json = await jsonData
+    /// 退避 / Retry-After 的等待实现；测试注入记录型实现以免真的睡眠。
+    var sleep: @Sendable (TimeInterval) async -> Void = { seconds in
+        try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+    }
 
-        // 主路径：efficiency points 构建 Codex 列表，insights 提供推荐分组与菜单栏选型。
-        let parsedInsights: [InsightGroup] = insightsRaw.flatMap { try? RadarParser.parseInsights(json: $0) } ?? []
-        let efficiency: [EfficiencyPoint] = efficiencyRaw.flatMap { try? RadarParser.parseEfficiency(json: $0) } ?? []
-        let comprehensive = insightsRaw.map(RadarParser.parseComprehensivePoints(json:)) ?? []
-        // 网页端会在 daily_development / hard_problems 为空时用 comprehensive_points + metrics 补算；
-        // 客户端按接口给出的 rule 复刻同一套规则，两组分别补算后保持服务端固有顺序。
-        let insights = RadarParser.supplementHardProblems(
-            insights: RadarParser.supplementDailyDevelopment(
-                insights: parsedInsights,
-                comprehensive: comprehensive,
-                efficiency: efficiency
-            ),
-            comprehensive: comprehensive,
-            efficiency: efficiency
-        )
+    /// 共享冷却使用的时钟；测试与 `sleep` 一起注入可控实现，避免真实时钟 + 立即返回的 sleep 空转。
+    var now: @Sendable () -> Date = { Date() }
 
-        let codex: [ScoredModel]
-        let insightGroups: [InsightGroup]
-        let codexSource: CodexDataSource
-        var localBestID: String? = nil
+    func scoreURL(for selection: BenchSelection) -> URL {
+        var components = URLComponents(url: scoreEndpoint, resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "model", value: selection.model),
+            URLQueryItem(name: "effort", value: selection.effort),
+            URLQueryItem(name: "view", value: "summary"),
+        ]
+        return components.url!
+    }
 
-        // current.json 本地估算结果（efficiency-only 时供菜单栏 identity 回退，全失败时作完整回退）。
-        let localScored: [ScoredModel]? = json
-            .flatMap { try? RadarParser.parseCodex(json: $0) }
-            .flatMap { try? RadarParser.scoreAndSort($0) }
+    // MARK: - 绑定
 
-        if !efficiency.isEmpty {
-            // 主路径：efficiency 指标 + insights 推荐；insights 失败时列表保持网站排序，
-            // 菜单栏用本地冠军 identity 匹配网站列表回退（本地公式不改变网站排序、不伪装推荐）。
-            codex = RadarParser.buildCodexFromEfficiency(points: efficiency, insights: insights)
-            insightGroups = insights
-            codexSource = .website
-            if insights.isEmpty {
-                localBestID = localScored?.first?.id
+    /// 读取并校验绑定；繁忙时有限次重试（网站自身对绑定读取也是一次性的，这里多给两次机会）。
+    func fetchBinding() async throws -> RadarBenchBinding {
+        var attempt = 0
+        while true {
+            attempt += 1
+            do {
+                let data = try await send(URLRequest(url: bindingURL))
+                do {
+                    return try RadarBenchParser.parseBinding(json: data)
+                } catch {
+                    throw RadarServiceError.decode(error.localizedDescription)
+                }
+            } catch RadarServiceError.busy(let status, let retryAfter) {
+                guard attempt < RadarBenchPolicy.maxAttempts,
+                      (retryAfter ?? 0) <= RadarBenchPolicy.maxWait else {
+                    throw RadarServiceError.busy(status: status, retryAfter: retryAfter)
+                }
+                await sleep(retryAfter ?? Self.backoff(attempt: attempt))
             }
-        } else if let scored = localScored {
-            // efficiency 失败：推荐条目本身只有寥寥几条（网站近期常返回空推荐分组），只拿它建列表会把
-            // 榜单塌缩成两三行；改用 current.json 本地估算的完整候选列表，并把站长推荐合并到匹配条目上
-            // （推荐 chip 与菜单栏选型仍归站长推荐）。UI 标注「本地估算」。
-            codex = RadarParser.applyRecommendations(scored, insights: insights)
-            insightGroups = insights
-            codexSource = .localEstimate
-            localBestID = scored.first?.id
-        } else if !insights.isEmpty {
-            // efficiency 与 current.json 都不可用：最后兜底，用推荐条目自身指标构建去重列表（仍为网站数据）。
-            // 标为 .recommendationsOnly，让 VM 能识别出这是最不完整的一档、不拿它覆盖上一次的好快照。
-            codex = RadarParser.buildCodexFromInsights(insights: insights)
-            insightGroups = insights
-            codexSource = .recommendationsOnly
-        } else {
-            throw RadarServiceError.decode("radar-insights / intelligence-efficiency / current.json 均不可用")
+        }
+    }
+
+    // MARK: - 逐档成绩
+
+    /// 读取一个档位的成绩（单次尝试，不重试）。响应必须通过与绑定的身份/范围校验。
+    func fetchObservation(_ selection: BenchSelection, binding: RadarBenchBinding) async throws -> RadarBenchObservation {
+        var request = URLRequest(url: scoreURL(for: selection))
+        request.setValue(Self.selectionHeaderValue, forHTTPHeaderField: Self.selectionHeaderField)
+        let data = try await send(request)
+        do {
+            return try RadarBenchParser.parseObservation(json: data, binding: binding, selection: selection)
+        } catch {
+            throw RadarServiceError.decode(error.localizedDescription)
+        }
+    }
+
+    /// 批量读取：去重、并发 ≤ 3、共享冷却（任一 worker 遇到繁忙，其余 worker 的下一次请求也等）。
+    /// 单档繁忙最多尝试 `maxAttempts` 次，等待遵循 Retry-After（超过 `maxWait` 则不等待、直接暂停整批）；
+    /// 连续多个档位重试耗尽、或站点以 428 拒绝时同样暂停整批，避免继续打一个已经拒绝我们的服务。
+    /// 每个档位完成（成功或最终失败）立即回调；因暂停而从未发起请求的档位不回调，计入 `skipped`。
+    /// 每次真正发请求前都重新检查取消、整批暂停与共享冷却（含已领取的档位和重试）。
+    func fetchBatch(
+        binding: RadarBenchBinding,
+        selections: [BenchSelection],
+        onResult: @escaping @MainActor (BenchSelection, Result<RadarBenchObservation, Error>) -> Void
+    ) async -> RadarBenchBatchOutcome {
+        var seen = Set<String>()
+        let unique = selections.filter { seen.insert($0.id).inserted }
+        guard !unique.isEmpty else { return RadarBenchBatchOutcome() }
+
+        let state = BatchState(pending: unique, now: now)
+        let tally = BatchTally()
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<min(RadarBenchPolicy.concurrency, unique.count) {
+                group.addTask {
+                    while !Task.isCancelled {
+                        guard let selection = await state.next() else { break }
+                        let result = await self.run(selection, binding: binding, state: state, onResult: onResult)
+                        await tally.record(result)
+                    }
+                }
+            }
         }
 
-        // Claude Code 分区完全来自 codexradar 的 claude-* 竞品条目：不再请求 claudecoderadar.com，
-        // mergeAnthropicIntoClaude 的 claude 参数固定传空列表（函数本身逻辑不变，只是雷达数据源永远为空）。
-        // 这批条目跟 Codex 数据同一次抓取，取不到时该分区判为不可用。
-        let (codexWithoutAnthropic, claude) = RadarParser.mergeAnthropicIntoClaude(
-            codex: codex, claude: []
-        )
-        let claudeStatus: ClaudeStatus = claude.isEmpty ? .unavailable : .ok
-
-        // 多源时间戳：insights/efficiency 的 source_updated_at → current.json → 当前时间。
-        let updatedAt = insightsRaw.flatMap { RadarParser.parseInsightsTimestamp(json: $0) }
-            ?? efficiencyRaw.flatMap { RadarParser.parseEfficiencyTimestamp(json: $0) }
-            ?? json.flatMap { RadarParser.parseTimestamp(json: $0) }
-            ?? Date()
-
-        return RadarSnapshot(
-            all: codexWithoutAnthropic + claude,
-            updatedAt: updatedAt,
-            claudeStatus: claudeStatus,
-            insights: insightGroups,
-            codexSource: codexSource,
-            localBestID: localBestID
-        )
+        var outcome = RadarBenchBatchOutcome()
+        outcome.succeeded = await tally.succeeded
+        outcome.failed = await tally.failed
+        outcome.skipped = await state.skippedCount
+        outcome.cancelled = max(0, unique.count - outcome.succeeded - outcome.failed - outcome.skipped)
+        outcome.stopReason = await state.stopReason
+        outcome.retryAfter = await state.stopRetryAfter
+        return outcome
     }
 
-    /// 权威源（insights / efficiency）的瞬时失败会让整段榜单降级，代价远大于一次重试：
-    /// 失败后短暂退避再试一次，两次都失败才按不可用处理。
-    private func dataRetryingOnce(from url: URL, timeout: TimeInterval) async -> Data? {
-        if let first = try? await data(from: url, timeout: timeout) { return first }
-        try? await Task.sleep(nanoseconds: 400_000_000)
-        return try? await data(from: url, timeout: timeout)
+    fileprivate enum RunResult {
+        case succeeded
+        /// 已发起过请求且最终失败（含重试等待期间被叫停）。
+        case failed
+        /// 已领取但发送前整批被叫停，从未发起请求。
+        case skipped
+        case cancelled
     }
 
-    private func data(from url: URL, timeout: TimeInterval) async throws -> Data {
-        var req = URLRequest(url: url)
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        req.timeoutInterval = timeout
+    private enum SendGate {
+        case go, stopped, cancelled
+    }
+
+    /// 发请求前的闸门：取消 → 整批暂停 → 共享冷却。等待期间别的 worker 可能延长冷却或叫停整批，
+    /// 所以每次醒来都重新检查，直到冷却真正结束才放行。
+    private func waitToSend(_ state: BatchState) async -> SendGate {
+        while true {
+            if Task.isCancelled { return .cancelled }
+            if await state.isStopped { return .stopped }
+            let wait = await state.remainingCooldown()
+            if wait <= 0 { return .go }
+            await sleep(wait)
+        }
+    }
+
+    private func run(
+        _ selection: BenchSelection,
+        binding: RadarBenchBinding,
+        state: BatchState,
+        onResult: @MainActor (BenchSelection, Result<RadarBenchObservation, Error>) -> Void
+    ) async -> RunResult {
+        var attempt = 0
+        var pendingRetryError: RadarServiceError?
+        while true {
+            attempt += 1
+            switch await waitToSend(state) {
+            case .go:
+                break
+            case .cancelled:
+                return .cancelled
+            case .stopped:
+                // 重试期间被叫停：之前已经尝试过，按失败收口；首次尝试前被叫停：从未发送，计 skipped。
+                if let pendingRetryError {
+                    await onResult(selection, .failure(pendingRetryError))
+                    return .failed
+                }
+                await state.skipClaimed()
+                return .skipped
+            }
+            do {
+                let observation = try await fetchObservation(selection, binding: binding)
+                await state.recordSuccess()
+                await onResult(selection, .success(observation))
+                return .succeeded
+            } catch is CancellationError {
+                return .cancelled
+            } catch let error as RadarServiceError {
+                switch error {
+                case .busy(_, let retryAfter):
+                    if let retryAfter, retryAfter > RadarBenchPolicy.maxWait {
+                        await state.stop("站点繁忙，请约 \(Int(retryAfter.rounded(.up))) 秒后重试", retryAfter: retryAfter)
+                        await onResult(selection, .failure(error))
+                        return .failed
+                    }
+                    let delay = min(retryAfter ?? Self.backoff(attempt: attempt), RadarBenchPolicy.maxWait)
+                    await state.coolDown(for: delay)
+                    if attempt >= RadarBenchPolicy.maxAttempts {
+                        if await state.recordBusyExhausted() {
+                            await state.stop("站点持续繁忙，已暂停本轮读取", retryAfter: nil)
+                        }
+                        await onResult(selection, .failure(error))
+                        return .failed
+                    }
+                    // 重试的等待交给下一轮 waitToSend：它按共享冷却的最新截止时间等。
+                    pendingRetryError = error
+                case .http(428):
+                    await state.stop("站点拒绝了选择请求头（428），已暂停本轮读取", retryAfter: nil)
+                    await onResult(selection, .failure(error))
+                    return .failed
+                default:
+                    await onResult(selection, .failure(error))
+                    return .failed
+                }
+            } catch {
+                await onResult(selection, .failure(error))
+                return .failed
+            }
+        }
+    }
+
+    // MARK: - 传输
+
+    private func send(_ template: URLRequest) async throws -> Data {
+        var request = template
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.timeoutInterval = Self.requestTimeout
+        request.httpShouldHandleCookies = false
 
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await URLSession.shared.data(for: req)
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let error as URLError {
+            switch error.code {
+            case .cancelled:
+                throw CancellationError()
+            case .timedOut, .networkConnectionLost, .cannotConnectToHost, .cannotFindHost,
+                 .dnsLookupFailed, .notConnectedToInternet:
+                throw RadarServiceError.busy(status: nil, retryAfter: nil)
+            default:
+                throw RadarServiceError.network(error.localizedDescription)
+            }
         } catch {
             throw RadarServiceError.network(error.localizedDescription)
         }
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            if [429, 502, 503, 504].contains(http.statusCode) {
+                throw RadarServiceError.busy(status: http.statusCode, retryAfter: Self.retryAfter(in: http))
+            }
             throw RadarServiceError.http(http.statusCode)
         }
         return data
     }
+
+    /// 无 Retry-After 时的指数退避：2s、4s……封顶 maxWait。
+    static func backoff(attempt: Int) -> TimeInterval {
+        min(2 * pow(2, Double(max(attempt - 1, 0))), RadarBenchPolicy.maxWait)
+    }
+
+    /// Retry-After：非负秒数（可带小数）或 HTTP-date；无法解析返回 nil。
+    static func retryAfter(in response: HTTPURLResponse, now: Date = Date()) -> TimeInterval? {
+        guard let raw = response.value(forHTTPHeaderField: "Retry-After")?
+            .trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
+        if raw.allSatisfy({ $0.isNumber || $0 == "." }), let seconds = Double(raw), seconds.isFinite {
+            return seconds
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return formatter.date(from: raw).map { max(0, $0.timeIntervalSince(now)) }
+    }
+}
+
+/// 批次共享状态：待读队列 + 共享冷却 + 暂停标志。
+private actor BatchState {
+    private var pending: [BenchSelection]
+    private var cooldownUntil = Date.distantPast
+    private var consecutiveBusyFailures = 0
+    private(set) var stopReason: String?
+    private(set) var stopRetryAfter: TimeInterval?
+    private(set) var skippedCount = 0
+    private let now: @Sendable () -> Date
+
+    init(pending: [BenchSelection], now: @escaping @Sendable () -> Date) {
+        self.pending = pending
+        self.now = now
+    }
+
+    var isStopped: Bool { stopReason != nil }
+
+    func next() -> BenchSelection? {
+        guard stopReason == nil, !pending.isEmpty else { return nil }
+        return pending.removeFirst()
+    }
+
+    /// 已领取、但发送前整批被叫停的档位。
+    func skipClaimed() { skippedCount += 1 }
+
+    func remainingCooldown() -> TimeInterval { max(0, cooldownUntil.timeIntervalSince(now())) }
+
+    func coolDown(for seconds: TimeInterval) {
+        cooldownUntil = max(cooldownUntil, now().addingTimeInterval(seconds))
+    }
+
+    func recordSuccess() { consecutiveBusyFailures = 0 }
+
+    /// 一个档位重试耗尽；返回是否已达到「连续繁忙失败」上限。
+    func recordBusyExhausted() -> Bool {
+        consecutiveBusyFailures += 1
+        return consecutiveBusyFailures >= RadarBenchPolicy.maxConsecutiveBusyFailures
+    }
+
+    func stop(_ reason: String, retryAfter: TimeInterval?) {
+        guard stopReason == nil else { return }
+        stopReason = reason
+        stopRetryAfter = retryAfter
+        skippedCount += pending.count
+        pending.removeAll()
+    }
+}
+
+private actor BatchTally {
+    private(set) var succeeded = 0
+    private(set) var failed = 0
+
+    fileprivate func record(_ result: RadarService.RunResult) {
+        switch result {
+        case .succeeded: succeeded += 1
+        case .failed: failed += 1
+        case .skipped, .cancelled: break   // skipped 已由 BatchState 计数；cancelled 由 fetchBatch 按差额得出
+        }
+    }
+}
+
+// MARK: - 观测缓存（UserDefaults）
+
+/// 每档最近一次**成功**观测的本地缓存：绑定身份 + 逐档原始响应 + 成功读取时间。
+/// 载入时每条都重新按当前绑定校验（身份、范围、自洽），并丢弃年龄超过 24h 的条目，
+/// 因此换了基准 / task_set_sha256 / 计分版本的旧缓存不可能被带进新数据。
+struct RadarBenchStore {
+    static let key = "radarBenchCache.v1"
+    static let schema = "codexradar-bench-cache-v1"
+
+    var defaults: UserDefaults = .standard
+
+    private struct Payload: Codable {
+        var schema: String
+        var binding: RadarBenchBinding
+        var entries: [Item]
+    }
+
+    private struct Item: Codable {
+        var selection: BenchSelection
+        var fetchedAt: Date
+        var raw: JSONValue
+    }
+
+    func load(now: Date) -> (binding: RadarBenchBinding, entries: [String: RadarBenchEntry])? {
+        guard let data = defaults.data(forKey: Self.key),
+              let payload = try? JSONDecoder().decode(Payload.self, from: data),
+              payload.schema == Self.schema else { return nil }
+        let known = Set(payload.binding.selections.map(\.id))
+        var entries: [String: RadarBenchEntry] = [:]
+        for item in payload.entries where known.contains(item.selection.id) {
+            let age = now.timeIntervalSince(item.fetchedAt)
+            guard age <= RadarBenchPolicy.maxCacheAge, age >= -300,
+                  let observation = try? RadarBenchParser.parseObservation(
+                    item.raw, binding: payload.binding, selection: item.selection) else { continue }
+            entries[item.selection.id] = RadarBenchEntry(observation: observation, fetchedAt: item.fetchedAt)
+        }
+        return (payload.binding, entries)
+    }
+
+    func save(binding: RadarBenchBinding, entries: [String: RadarBenchEntry]) {
+        let items: [Item] = binding.selections.compactMap { selection in
+            guard let entry = entries[selection.id], let observation = entry.observation,
+                  let fetchedAt = entry.fetchedAt else { return nil }
+            return Item(selection: selection, fetchedAt: fetchedAt, raw: observation.raw)
+        }
+        let payload = Payload(schema: Self.schema, binding: binding, entries: items)
+        if let data = try? JSONEncoder().encode(payload) { defaults.set(data, forKey: Self.key) }
+    }
+
+    func clear() { defaults.removeObject(forKey: Self.key) }
 }

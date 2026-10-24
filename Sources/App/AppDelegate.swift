@@ -24,7 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         setupStatusItem()
         setupPopover()
 
-        Task { await viewModel.refresh() }
+        // 单元测试以本 App 为宿主：宿主启动时不真实联网、不写观测缓存，测试自己用 stub 驱动 ViewModel。
+        guard NSClassFromString("XCTestCase") == nil else { return }
+        Task { await viewModel.refresh(trigger: .launch) }
         startPolling()
     }
 
@@ -52,10 +54,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func updateStatusItemTitle() {
         guard let button = statusItem.button else { return }
         let title = StatusItemTitleBuilder.make(snapshot: viewModel.snapshot)
-        guard !button.attributedTitle.isEqual(to: title) else { return }
+        let detail = StatusItemTitleBuilder.detail(snapshot: viewModel.snapshot)
+        // 标题没变时 tooltip（失败 / 过旧 / 读取时间）仍可能变，所以先单独更新。
+        if button.toolTip != detail { button.toolTip = detail }
+        guard !button.attributedTitle.isEqual(to: title) else {
+            if let detail { button.setAccessibilityValue("\(title.string)。\(detail)") }
+            return
+        }
         button.attributedTitle = title
         button.setAccessibilityTitle("CodexRadar")
-        button.setAccessibilityValue(title.string)
+        button.setAccessibilityValue(detail.map { "\(title.string)。\($0)" } ?? title.string)
     }
 
     private func setupPopover() {
@@ -118,7 +126,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func startPolling() {
         pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
-            Task { await self?.viewModel.refresh() }
+            // 后台轮询只补读缺失/过期（≥3h）的档位，不整批重扫。
+            Task { await self?.viewModel.refresh(trigger: .background) }
         }
     }
 
@@ -130,7 +139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func manualRefresh() {
-        Task { await viewModel.refresh() }   // 不收起弹窗，展示加载态
+        Task { await viewModel.refresh(trigger: .manual) }   // 不收起弹窗，展示加载态
     }
 
     private func quitApp() {

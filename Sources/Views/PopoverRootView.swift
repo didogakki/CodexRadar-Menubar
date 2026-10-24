@@ -15,25 +15,47 @@ private struct BoardHeightKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
+/// 榜单以外的固定区域（头部 / 模式与筛选条 / 底部操作）的自然高度之和。
+/// 榜单滚动区的上限由「屏幕可用高度 − 这部分实测高度」决定，长榜单或头部提示变长时
+/// 底部的刷新 / 打开网站 / 退出也始终留在屏幕内、可点到，而不是靠一个写死的估算值。
+private struct ChromeHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value += nextValue() }
+}
+
+private extension View {
+    func reportsChromeHeight() -> some View {
+        background(GeometryReader { geo in
+            Color.clear.preference(key: ChromeHeightKey.self, value: geo.size.height)
+        })
+    }
+}
+
 struct PopoverRootView: View {
     @ObservedObject var vm: RadarViewModel
     let actions: PopoverActions
 
     @State private var boardHeight: CGFloat = 0
+    @State private var chromeHeight: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
-            HeaderView(vm: vm)
-
-            Rectangle().fill(DS.divider).frame(height: 0.5)
+            VStack(spacing: 0) {
+                HeaderView(vm: vm)
+                Rectangle().fill(DS.divider).frame(height: 0.5)
+            }
+            .reportsChromeHeight()
 
             content
 
-            Rectangle().fill(DS.divider).frame(height: 0.5)
-                .padding(.top, 6).padding(.bottom, 4)
-
-            MenuListView(actions: actions)
+            VStack(spacing: 0) {
+                Rectangle().fill(DS.divider).frame(height: 0.5)
+                    .padding(.top, 6).padding(.bottom, 4)
+                MenuListView(actions: actions)
+            }
+            .reportsChromeHeight()
         }
+        .onPreferenceChange(ChromeHeightKey.self) { chromeHeight = $0 }
         .padding(.vertical, 6)
         .frame(width: DS.width)
         .background(
@@ -45,37 +67,44 @@ struct PopoverRootView: View {
     }
 
     /// 榜单滚动区上限：按屏幕可用高度动态计算，尽量整屏展示全部条目，超出才滚动/限制。
-    private static func boardMaxHeight(screenHeight: CGFloat) -> CGFloat {
-        // chromeHeight 估算头部 + 筛选条 + 上下分隔线 + 底部菜单在 popover 中占用的高度；
-        // safetyMargin 给屏幕顶部菜单栏与底部留白，避免弹窗贴边。
-        let chromeHeight: CGFloat = 260
+    /// chromeHeight 是榜单以外固定区域的实测高度（首帧未测到时用 260 估算）；
+    /// 外加 12 为根视图上下内边距，safetyMargin 给屏幕顶部菜单栏与底部留白，避免弹窗贴边。
+    /// 屏幕再矮也至少留 120 的滚动区；其余情况下滚动区 + 固定区域恰好不超过屏幕，固定操作区始终可达。
+    static func boardMaxHeight(screenHeight: CGFloat, chromeHeight: CGFloat) -> CGFloat {
+        let chrome = chromeHeight > 0 ? chromeHeight + 12 : 260
         let safetyMargin: CGFloat = 40
-        return max(240, screenHeight - chromeHeight - safetyMargin)
+        return max(120, screenHeight - chrome - safetyMargin)
     }
 
     @ViewBuilder
     private var content: some View {
         if let snapshot = vm.snapshot {
             VStack(spacing: 0) {
-                ModeSwitchBar(vm: vm)
-                Rectangle().fill(DS.divider).frame(height: 0.5)
+                VStack(spacing: 0) {
+                    ModeSwitchBar(vm: vm)
+                    Rectangle().fill(DS.divider).frame(height: 0.5)
 
-                // 筛选行与榜单共用 snapshot.availableSections，顺序一致、不会筛出空组。
-                FilterBarView(vm: vm, sections: snapshot.availableSections)
-                Rectangle().fill(DS.divider).frame(height: 0.5)
+                    // 筛选行与榜单共用 snapshot.availableSections，顺序一致、不会筛出空组。
+                    FilterBarView(vm: vm, sections: snapshot.availableSections)
+                    Rectangle().fill(DS.divider).frame(height: 0.5)
 
-                // 场景推荐区：只在「完整榜单」模式展示——「模型推荐」视图本身就是推荐结论，
-                // 两套推荐口径（综合 IQ 场景推荐 vs 真实工程 IQ + 均价推荐）同时出现会互相打架。
-                if vm.listMode == .full {
-                    let showPicks = vm.boardFilter == nil || vm.boardFilter == .vendor(.openai)
-                    let picks = showPicks ? ScenarioPicksView.groups(in: snapshot) : []
-                    if !picks.isEmpty {
-                        ScenarioPicksView(groups: picks)
-                        Rectangle().fill(DS.divider).frame(height: 0.5)
+                    // 场景推荐区：只在「完整榜单」模式展示——「模型推荐」视图本身就是推荐结论，
+                    // 两套推荐口径（综合 IQ 场景推荐 vs 真实工程 IQ + 均价推荐）同时出现会互相打架。
+                    // Radar Bench 没有站长场景推荐（insights 为空），该区自然不出现。
+                    if vm.listMode == .full {
+                        let showPicks = vm.boardFilter == nil || vm.boardFilter == .vendor(.openai)
+                        let picks = showPicks ? ScenarioPicksView.groups(in: snapshot) : []
+                        if !picks.isEmpty {
+                            ScenarioPicksView(groups: picks)
+                            Rectangle().fill(DS.divider).frame(height: 0.5)
+                        }
                     }
                 }
+                .reportsChromeHeight()
 
-                let maxHeight = Self.boardMaxHeight(screenHeight: NSScreen.main?.visibleFrame.height ?? 900)
+                let maxHeight = Self.boardMaxHeight(
+                    screenHeight: NSScreen.main?.visibleFrame.height ?? 900, chromeHeight: chromeHeight
+                )
                 // 榜单始终放在滚动区里，高度钉死为 min(自然高度, 上限)：放得下时高度恰好等于内容、
                 // 视觉上不滚动；放不下才真的滚动。不能用 ViewThatFits —— 它按"外部提议的高度"二选一，
                 // 而 popover 的提议高度反过来又取决于内容高度，会互相咬死（首帧只有两百多点时
@@ -133,7 +162,8 @@ struct PopoverRootView: View {
                             models: group.models,
                             isLocalEstimate: snapshot.codexSource == .localEstimate,
                             onlyFrontier: vm.onlyFrontier,
-                            protectedID: snapshot.menuBarBest?.id
+                            protectedID: snapshot.menuBarDisplayedID,
+                            scoreColumnTitle: snapshot.benchmark.map { "分数 /\(Int($0.binding.scoreMax))" } ?? "IQ"
                         )
                     }
                 case .claude:
@@ -142,7 +172,7 @@ struct PopoverRootView: View {
                         models: snapshot.claudeDisplayGroup,
                         unavailable: snapshot.claudeStatus == .unavailable,
                         onlyFrontier: vm.onlyFrontier,
-                        protectedID: snapshot.menuBarBest?.id
+                        protectedID: snapshot.menuBarDisplayedID
                     )
                 }
             }
@@ -228,26 +258,39 @@ struct ModeSwitchBar: View {
     @ObservedObject var vm: RadarViewModel
 
     var body: some View {
-        HStack(spacing: 8) {
+        // 说明文字单独成行（可换行、不挤占模式 chip 的横向空间），窄窗下也不会把 chip 或其右侧挤出可视区。
+        VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 4) {
                 modeChip(.recommendation)
                 modeChip(.full)
+                Spacer(minLength: 0)
             }
 
-            Spacer(minLength: 6)
-
-            if vm.listMode == .recommendation {
-                Text("推荐 = 真实工程 IQ 达该模型最高档 95% 内取价最低档；价格为等价按量计费估算，非订阅扣费")
+            if let note = footnote {
+                Text(note)
                     .font(DF.pro(9, .regular))
                     .foregroundStyle(DS.sec(0.35))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.trailing)
+                    .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: 240, alignment: .trailing)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 15)
         .padding(.vertical, 6)
+    }
+
+    /// 口径说明。Radar Bench：分数满分、费用是 API 等价估算而非订阅扣费，推荐是本地计算而非网站推荐。
+    private var footnote: String? {
+        if let bench = vm.snapshot?.benchmark {
+            let scale = "分数满分 \(Int(bench.binding.scoreMax))"
+            let cost = "$ 为 API 等价费用，非订阅扣费；* 为样本不全的已知样本均值"
+            if vm.listMode == .recommendation {
+                return "本地计算，非网站推荐：分数达该模型最高档 95% 内取费用最低；档位未读全、覆盖或费用样本不全时不推荐。\(scale)。\(cost)"
+            }
+            return "\(scale)。\(cost)"
+        }
+        guard vm.listMode == .recommendation else { return nil }
+        return "推荐 = 真实工程 IQ 达该模型最高档 95% 内取价最低档；价格为等价按量计费估算，非订阅扣费"
     }
 
     private func modeChip(_ mode: ModelListMode) -> some View {
@@ -277,73 +320,45 @@ private func previewRoot(vm: RadarViewModel) -> PopoverRootView {
     )
 }
 
-/// 接近真实线上规模的预览数据：19 个 Codex 档位 + 10 个 Claude 档位 + 4 个推荐分组，
-/// 用于验证榜单高度确实被 clamp（整窗不超屏）。
+/// 接近真实线上规模的预览数据（Radar Bench 口径，固定 fixture、无随机性）：
+/// 3 个模型 × 若干思考档，含一档覆盖不完整（暂定）与一档费用样本不全，用于验证榜单高度 clamp 与各类角标。
 func previewSnapshot() -> RadarSnapshot {
-    // 5 个厂商各出一款真实命名的型号，验证厂商概览首屏能同时看到 OpenAI/xAI/DeepSeek/Google。
-    let codexModels = ["gpt-6-astra", "gpt-5.6-sol", "grok-4.6", "deepseek-v4-turbo", "gemini-2.5-pro"]
-    let efforts = ["low", "medium", "high", "xhigh"]
-    // 5 型号 × 4 档 = 20，取前 19 个组合，指标按索引推导（确定性、避免重复字面量）
-    var effPoints: [EfficiencyPoint] = []
-    for i in 0..<19 {
-        let d: Double = Double(i)
-        let iq: Double = 105 - d * 2
-        let passed: Int = max(4, 9 - i / 3)
-        let price: Double = 12 + d * 2.5
-        let minutes: Double = 60 + d * 14
-        let costIndex: Double = 0.18 + d * 0.03
-        effPoints.append(EfficiencyPoint(
-            model: codexModels[i / 4],
-            effort: efforts[i % 4],
-            iq: iq,
-            passed: passed,
-            validTasks: 20,
-            averagePriceUSD: price,
-            averageMinutes: minutes,
-            combinedCostIndex: costIndex
-        ))
-    }
-    func insightItem(_ p: EfficiencyPoint) -> InsightItem {
-        InsightItem(
-            model: p.model, effort: p.effort, iq: p.iq, passed: p.passed,
-            samples: p.validTasks, averageCostUSD: p.averagePriceUSD,
-            averageDurationMinutes: p.averageMinutes,
-            combinedCostIndex: p.combinedCostIndex, rule: nil, trend48h: nil
-        )
-    }
-    let insightTitles = [
-        ("daily_development", "日常开发"),
-        ("hard_tasks", "难题攻坚"),
-        ("background_automation", "后台自动化"),
-        ("long_running", "跑龙虾类任务"),
+    let layout: [(model: String, efforts: [String])] = [
+        ("gpt-6.1-sol", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+        ("gpt-6-astra", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+        ("gpt-5.6-luna", ["low", "medium", "high", "xhigh", "max"]),
     ]
-    let insights: [InsightGroup] = insightTitles.enumerated().map { index, pair in
-        InsightGroup(key: pair.0, title: pair.1, rule: nil,
-                     items: [insightItem(effPoints[index * 3])])
-    }
-    let codex = RadarParser.buildCodexFromEfficiency(points: effPoints, insights: insights)
-    let claudeDepths = ["low", "medium", "high", "max"]
-    let claudeModels = ["opus-4.8", "opus-4.7", "sonnet-4.6"]
-    var claudeResults: [ModelResult] = []
-    for i in 0..<10 {
-        let d: Double = Double(i)
-        let iq: Double = 110 - d * 3
-        let passed: Int = max(4, 8 - i / 2)
-        let cost: Double = 40 + d * 9
-        let minutes: Int = 120 + i * 30
-        claudeResults.append(ModelResult(
-            name: claudeModels[i / 4], depth: claudeDepths[i % 4],
-            iq: iq, passed: passed, tasks: 12,
-            cost: cost, timeMinutes: minutes,
-            family: .claude, isReference: true
-        ))
-    }
-    let claude = RadarParser.buildClaudeByIQ(claudeResults)
-    return RadarSnapshot(
-        all: codex + claude,
-        updatedAt: Date().addingTimeInterval(-14 * 3600 - 37 * 60),
-        insights: insights,
-        codexSource: .website
+    let selections = layout.flatMap { item in item.efforts.map { BenchSelection(model: item.model, effort: $0) } }
+    let binding = RadarBenchBinding(
+        benchmark: "radar-bench-final64-20261004", catalogVersion: "preview",
+        taskSetSHA256: String(repeating: "a", count: 64), scoreVersion: "radar-bench-v2-150",
+        scoreMax: 150, totalTasks: 64, selections: selections
     )
+    let now = Date()
+    let read = now.addingTimeInterval(-14 * 60)
+    var entries: [String: RadarBenchEntry] = [:]
+    for (index, selection) in selections.enumerated() {
+        let score = 96.0 - Double(index) * 3.4
+        let partialCoverage = index == 9
+        let partialCost = index == 1
+        let cost = RadarBenchMetric(
+            knownTotal: (0.4 + Double(index) * 0.35) * (partialCost ? 79 : 80),
+            knownSamples: partialCost ? 79 : 80, missingSamples: partialCost ? 1 : 0, missingReason: nil
+        )
+        let elapsed = RadarBenchMetric(
+            knownTotal: (240_000 + Double(index) * 38_000) * 80, knownSamples: 80, missingSamples: 0, missingReason: nil
+        )
+        let observation = RadarBenchObservation(
+            selection: selection, schema: "radar-bench-public-summary-v6-150-details",
+            benchmark: binding.benchmark, catalogVersion: binding.catalogVersion,
+            taskSetSHA256: binding.taskSetSHA256, scoreVersion: binding.scoreVersion, scoreMax: 150,
+            score: score, scoreStatus: partialCoverage ? "provisional" : "complete",
+            coverage: partialCoverage ? 43 : 64, requiredTasks: 64, gradedRunsCount: 80, sampleCount: 80,
+            costBasis: "official_standard_api_equivalent", elapsed: elapsed, apiEquivalentUSD: cost,
+            latestGradedAt: now.addingTimeInterval(-9 * 3600), sourceAsOf: nil, raw: .object([:])
+        )
+        entries[selection.id] = RadarBenchEntry(observation: observation, fetchedAt: read)
+    }
+    return RadarBenchParser.makeSnapshot(binding: binding, entries: entries, now: now)!
 }
 #endif

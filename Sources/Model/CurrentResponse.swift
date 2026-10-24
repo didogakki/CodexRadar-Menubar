@@ -299,3 +299,62 @@ struct ClaudeModelSeries: Decodable {
         time = try container.decode([Double?].self, forKey: .time)
     }
 }
+
+// MARK: - Radar Bench（radar-bench-binding.json / radar-bench-score）
+
+/// 通用 JSON 值：Radar Bench 响应先整体解成它，再由 RadarBenchParser 按需取字段。
+/// 原始值随观测一并保留（缓存也存它），网站新增的未知字段不会在解析中丢失。
+enum JSONValue: Codable, Equatable {
+    case null
+    case bool(Bool)
+    case number(Double)
+    case string(String)
+    case array([JSONValue])
+    case object([String: JSONValue])
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() { self = .null }
+        else if let value = try? container.decode(Bool.self) { self = .bool(value) }
+        else if let value = try? container.decode(Double.self) { self = .number(value) }
+        else if let value = try? container.decode(String.self) { self = .string(value) }
+        else if let value = try? container.decode([JSONValue].self) { self = .array(value) }
+        else { self = .object(try container.decode([String: JSONValue].self)) }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .null: try container.encodeNil()
+        case .bool(let value): try container.encode(value)
+        case .number(let value): try container.encode(value)
+        case .string(let value): try container.encode(value)
+        case .array(let value): try container.encode(value)
+        case .object(let value): try container.encode(value)
+        }
+    }
+
+    subscript(key: String) -> JSONValue? {
+        guard case .object(let dict) = self else { return nil }
+        return dict[key]
+    }
+
+    var isNull: Bool { if case .null = self { return true } else { return false } }
+    var objectValue: [String: JSONValue]? { if case .object(let dict) = self { return dict } else { return nil } }
+    var arrayValue: [JSONValue]? { if case .array(let items) = self { return items } else { return nil } }
+    var boolValue: Bool? { if case .bool(let value) = self { return value } else { return nil } }
+
+    var stringValue: String? { if case .string(let value) = self { return value } else { return nil } }
+
+    /// 有限数值（NaN / Inf 不可能出自合法 JSON，仍防御）。
+    var doubleValue: Double? {
+        if case .number(let value) = self, value.isFinite { return value }
+        return nil
+    }
+
+    /// 整数值：数字必须是整数（78.5 不是整数），且在 Int 范围内。
+    var intValue: Int? {
+        guard let value = doubleValue, value == value.rounded(), abs(value) < 9e15 else { return nil }
+        return Int(value)
+    }
+}

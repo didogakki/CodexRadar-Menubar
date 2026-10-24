@@ -1,4 +1,5 @@
-// 头部块：雷达图标 + 品牌名 + 右侧两行（绝对检测时间戳 / 距今相对时间）。
+// 头部块：雷达图标 + 品牌名 + 右侧几行（成功读取时间 / 距今与来源评分时间 / 读取进度与失败提示）。
+// 「读取」是本地成功拉取的时间；「评分」是接口给出的最近一次评分时间，缺失就不显示，绝不拿当前时间顶替。
 import SwiftUI
 
 struct HeaderView: View {
@@ -18,6 +19,12 @@ struct HeaderView: View {
         .padding(.bottom, 10)
     }
 
+    private var secondLine: String {
+        var text = "距今 \(vm.relativeLabel)"
+        if let graded = vm.snapshot?.gradedAtLabel { text += " · 评分 \(graded)" }
+        return text
+    }
+
     @ViewBuilder
     private var rightBlock: some View {
         if let err = vm.lastError, vm.snapshot == nil {
@@ -31,19 +38,28 @@ struct HeaderView: View {
                 .frame(maxWidth: 180, alignment: .trailing)
         } else if vm.snapshot != nil {
             VStack(alignment: .trailing, spacing: 1) {
-                Text(vm.snapshot?.checkedAtLabel ?? "—")
+                Text("读取 \(vm.snapshot?.checkedAtLabel ?? "—")")
                     .font(DF.mono(10, .regular))
                     .foregroundStyle(DS.sec(0.5))
-                Text("距今 \(vm.relativeLabel)")
+                Text(secondLine)
                     .font(DF.pro(9, .regular))
                     .foregroundStyle(DS.sec(0.32))
-                // 保留上一次好快照 / 本次刷新失败时，明确标出榜单不是刚拉到的。
-                if vm.lastError != nil {
-                    Text("未更新，展示上次结果")
+                if let progress = vm.progressLabel {
+                    Text(progress)
+                        .font(DF.pro(9, .regular))
+                        .foregroundStyle(DS.blue.opacity(0.9))
+                }
+                // 本次刷新有失败 / 暂停时，明确标出原因，榜单里沿用的行带「缓存」角标。
+                if let notice = vm.lastError {
+                    Text(notice)
                         .font(DF.pro(9, .regular))
                         .foregroundStyle(DS.orange.opacity(0.85))
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            .frame(maxWidth: 240, alignment: .trailing)
         }
     }
 }

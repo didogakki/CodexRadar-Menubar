@@ -26,6 +26,7 @@ struct GroupRowView: View {
                 .foregroundStyle(DS.sec(0.5))
                 .fixedSize()
                 .layoutPriority(1)
+            BenchStatusTags(model: model)
             if !model.recommendedIn.isEmpty {
                 recommendedChips
             }
@@ -49,11 +50,11 @@ struct GroupRowView: View {
                     .layoutPriority(1)
             }
             HStack(spacing: 3) {
-                Text("IQ").font(DF.pro(8, .regular)).foregroundStyle(DS.sec(0.4))
+                Text(model.scoreCaption).font(DF.pro(8, .regular)).foregroundStyle(DS.sec(0.4))
                 Text(model.iqLabel)
                     .font(DF.mono(13, .semibold))
                     .monospacedDigit()
-                    .foregroundStyle(DS.iqColor(model.iq))
+                    .foregroundStyle(DS.scoreColor(model))
             }
             .fixedSize()
             .layoutPriority(1)
@@ -89,7 +90,8 @@ struct GroupRowView: View {
     }
 
     private var accessibilityLabel: String {
-        var parts = ["\(model.result.name) \(model.result.depth)", "IQ \(model.iqLabel)"]
+        var parts = ["\(model.result.name) \(model.result.depth)", "\(model.scoreCaption) \(model.iqLabel)"]
+        parts.append(contentsOf: model.benchAccessibilityParts)
         if let cost = model.validCostLabel { parts.append("价格 \(cost)") }
         if !model.recommendedIn.isEmpty {
             parts.append("推荐用于\(model.recommendedIn.joined(separator: "、"))")
@@ -98,5 +100,58 @@ struct GroupRowView: View {
             parts.append("比同组的 \(dominator.result.name) \(dominator.result.depth) 贵 \(badge.dropFirst())倍且不更强")
         }
         return parts.joined(separator: "，")
+    }
+}
+
+/// Radar Bench 行的状态角标：覆盖未完整（暂定 / 待测）与沿用缓存。完整且新鲜的行不显示任何角标。
+/// 悬停提示给出成功读取时间（本地时钟，不是评分时间）。
+struct BenchStatusTags: View {
+    let model: ScoredModel
+
+    var body: some View {
+        if let bench = model.result.bench {
+            HStack(spacing: 3) {
+                if !bench.isComplete {
+                    tag(bench.score == nil ? "待测 \(bench.coverage)/\(bench.requiredTasks)"
+                                           : "暂定 \(bench.coverage)/\(bench.requiredTasks)",
+                        color: DS.orange)
+                }
+                if model.benchRead?.isStale == true {
+                    tag("缓存", color: DS.sec(0.55))
+                }
+            }
+            .fixedSize()
+            .layoutPriority(1)
+            .help(model.benchReadHelp ?? "")
+        }
+    }
+
+    private func tag(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(DF.pro(8, .medium))
+            .foregroundStyle(color)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(color.opacity(0.16)))
+    }
+}
+
+extension ScoredModel {
+    /// 悬停说明：成功读取时间 + 最近一次失败原因（若有）。
+    var benchReadHelp: String? {
+        guard let read = benchRead else { return nil }
+        var text = "成功读取 \(RadarSnapshot.absoluteLabel(read.fetchedAt))"
+        if let error = read.lastError { text += "；最近一次刷新失败：\(error)，沿用此前结果" }
+        return text
+    }
+
+    /// 无障碍补充：覆盖状态、缓存、费用口径（仅 Radar Bench 行）。
+    var benchAccessibilityParts: [String] {
+        guard let bench = result.bench else { return [] }
+        var parts: [String] = []
+        if !bench.isComplete { parts.append("评分覆盖 \(bench.coverage)/\(bench.requiredTasks)，\(bench.score == nil ? "尚无分数" : "暂定")") }
+        if benchRead?.isStale == true { parts.append("沿用缓存") }
+        if let note = benchCostNote { parts.append(note) }
+        return parts
     }
 }

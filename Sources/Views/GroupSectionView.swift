@@ -8,6 +8,7 @@ struct GroupSectionView: View {
     var isLocalEstimate: Bool = false   // Codex 回退到 current.json 本地估算时明确标注
     var onlyFrontier: Bool = false      // 只看性价比前沿：隐藏被压制的行
     var protectedID: String? = nil      // 菜单栏当前档位：被压制也不隐藏，避免菜单栏结论在榜单里消失
+    var scoreColumnTitle: String = "IQ" // 右侧分数列标注；Radar Bench 为「分数 /150」
 
     var body: some View {
         if unavailable {
@@ -60,7 +61,7 @@ struct GroupSectionView: View {
             Rectangle()
                 .fill(DS.groupLine)
                 .frame(height: 0.5)
-            Text(isLocalEstimate ? "本地估算" : (hiddenCount > 0 ? "IQ · 隐藏 \(hiddenCount)" : "IQ"))
+            Text(isLocalEstimate ? "本地估算" : (hiddenCount > 0 ? "\(scoreColumnTitle) · 隐藏 \(hiddenCount)" : scoreColumnTitle))
                 .font(DF.pro(9, .regular))
                 .foregroundStyle(isLocalEstimate ? DS.orange.opacity(0.8) : DS.sec(0.35))
         }
@@ -111,7 +112,7 @@ struct ModelRecommendationBoardView: View {
             // 只用代表档算 verdicts 会漏掉「压制者本身不是任何组代表档」的情况，见
             // ModelRecommendationFrontierFilter 头部注释。
             let verdicts = CostEfficiency.verdicts(in: groups.flatMap(\.tiers))
-            let menuBarID = snapshot.menuBarBest?.id
+            let menuBarID = snapshot.menuBarDisplayedID
             let visible = groups.filter { isVisible($0, verdicts: verdicts, menuBarID: menuBarID) }
             // 圆点颜色沿用该条目在完整榜单里的原始排名位次，不按这里的折叠分组顺序重新计数——
             // 同一条目切换「模型推荐」/「完整榜单」看到的应是同一个颜色。展示层过滤掉、不在
@@ -199,7 +200,7 @@ struct ModelRecommendationBoardView: View {
                 .tracking(0.6)
                 .foregroundStyle(Color.white.opacity(0.72))
             Rectangle().fill(DS.groupLine).frame(height: 0.5)
-            Text(hiddenCount > 0 ? "推荐 · 隐藏 \(hiddenCount)" : "推荐")
+            Text(hiddenCount > 0 ? "本地推荐 · 隐藏 \(hiddenCount)" : "本地推荐")
                 .font(DF.pro(9, .regular))
                 .foregroundStyle(DS.sec(0.35))
         }
@@ -313,12 +314,13 @@ struct ModelRecommendationRowView: View {
                     .background(Capsule().fill(Color.white.opacity(0.06)))
                     .fixedSize()
             }
-            if let depth = group.outcome.displayModel?.result.depth {
-                Text(depth)
+            if let displayModel = group.outcome.displayModel {
+                Text(displayModel.result.depth)
                     .font(DF.mono(11, .medium))
                     .foregroundStyle(DS.sec(0.5))
                     .fixedSize()
                     .layoutPriority(1)
+                BenchStatusTags(model: displayModel)
             }
             if let note = collapsedNote {
                 Text(note)
@@ -340,11 +342,11 @@ struct ModelRecommendationRowView: View {
                 }
                 .frame(width: TierColumnMetrics.priceWidth, alignment: .trailing)
                 HStack(spacing: 3) {
-                    Text("IQ").font(DF.pro(8, .regular)).foregroundStyle(DS.sec(0.4))
+                    Text(model.scoreCaption).font(DF.pro(8, .regular)).foregroundStyle(DS.sec(0.4))
                     Text(model.iqLabel)
                         .font(DF.mono(13, .semibold))
                         .monospacedDigit()
-                        .foregroundStyle(DS.iqColor(model.iq))
+                        .foregroundStyle(DS.scoreColor(model))
                 }
                 .frame(width: TierColumnMetrics.iqWidth, alignment: .trailing)
             }
@@ -375,6 +377,12 @@ struct ModelRecommendationRowView: View {
             return "暂无可靠推荐 · 无有效价格"
         case .unavailable(.unreliableCodexSource):
             return "暂无可靠推荐 · 数据源降级（本地估算/站长推荐）"
+        case .unavailable(.missingTiers):
+            return "暂无可靠推荐 · 部分档位尚未读取"
+        case .unavailable(.incompleteCoverage):
+            return "暂无可靠推荐 · 评分覆盖不完整"
+        case .unavailable(.incompleteCost):
+            return "暂无可靠推荐 · 费用样本不完整"
         }
     }
 
@@ -385,8 +393,9 @@ struct ModelRecommendationRowView: View {
                 .font(DF.mono(11, isRecommended ? .semibold : .regular))
                 .foregroundStyle(isRecommended ? DS.text88 : DS.sec(0.5))
                 .frame(width: 52, alignment: .leading)
+            BenchStatusTags(model: tier)
             if isRecommended {
-                Text("推荐")
+                Text("本地推荐")
                     .font(DF.pro(8, .semibold))
                     .foregroundStyle(DS.blue)
                     .padding(.horizontal, 4)
@@ -407,11 +416,11 @@ struct ModelRecommendationRowView: View {
             }
             .frame(width: TierColumnMetrics.priceWidth, alignment: .trailing)
             HStack(spacing: 3) {
-                Text("IQ").font(DF.pro(8, .regular)).foregroundStyle(DS.sec(0.35))
+                Text(tier.scoreCaption).font(DF.pro(8, .regular)).foregroundStyle(DS.sec(0.35))
                 Text(tier.iqLabel)
                     .font(DF.mono(12, isRecommended ? .semibold : .regular))
                     .monospacedDigit()
-                    .foregroundStyle(DS.iqColor(tier.iq))
+                    .foregroundStyle(DS.scoreColor(tier))
             }
             .frame(width: TierColumnMetrics.iqWidth, alignment: .trailing)
             // 同宽透明箭头占位：折叠行末尾有 chevron，展开行没有，靠这个占位对齐两者右沿。
@@ -425,9 +434,10 @@ struct ModelRecommendationRowView: View {
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "\(tier.result.depth) 档，IQ \(tier.iqLabel)"
+            "\(tier.result.depth) 档，\(tier.scoreCaption) \(tier.iqLabel)"
+                + tier.benchAccessibilityParts.map { "，\($0)" }.joined()
                 + (tier.validCostLabel.map { "，\($0)" } ?? "")
-                + (isRecommended ? "，推荐档位" : "")
+                + (isRecommended ? "，本地推荐档位" : "")
         )
     }
 
@@ -435,18 +445,24 @@ struct ModelRecommendationRowView: View {
         var parts = [group.modelName]
         switch group.outcome {
         case .recommended(let model, let maxIQ, let threshold):
-            parts.append("推荐 \(model.result.depth) 档")
-            parts.append("IQ \(model.iqLabel)")
+            parts.append("本地推荐 \(model.result.depth) 档")
+            parts.append("\(model.scoreCaption) \(model.iqLabel)")
             if let cost = model.validCostLabel { parts.append("价格 \(cost)") }
-            parts.append("门槛为最高档 IQ \(String(format: "%.1f", maxIQ)) 的 95%，即 \(String(format: "%.1f", threshold))")
+            parts.append("门槛为最高档\(model.scoreCaption) \(String(format: "%.1f", maxIQ)) 的 95%，即 \(String(format: "%.1f", threshold))")
         case .singleComparableTier(let model):
-            parts.append("仅一档可比较：\(model.result.depth)，IQ \(model.iqLabel)")
+            parts.append("仅一档可比较：\(model.result.depth)，\(model.scoreCaption) \(model.iqLabel)")
         case .unavailable(.noValidScore):
             parts.append("暂无可靠推荐，无有效成绩")
         case .unavailable(.noValidPrice):
             parts.append("暂无可靠推荐，无有效价格")
         case .unavailable(.unreliableCodexSource):
             parts.append("暂无可靠推荐，数据源为本地估算或站长推荐，非网站权威测量")
+        case .unavailable(.missingTiers):
+            parts.append("暂无可靠推荐，该模型部分思考档尚未成功读取")
+        case .unavailable(.incompleteCoverage):
+            parts.append("暂无可靠推荐，评分覆盖不完整")
+        case .unavailable(.incompleteCost):
+            parts.append("暂无可靠推荐，候选档位的费用样本不完整")
         }
         return parts.joined(separator: "，")
     }

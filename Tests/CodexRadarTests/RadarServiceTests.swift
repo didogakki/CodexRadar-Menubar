@@ -1,565 +1,983 @@
-// 覆盖 RadarService.fetch 的集成路径：current.json 成功 + Claude 源失败时应仍返回 Codex 组，并标记 Claude unavailable。
+// 覆盖 Radar Bench（radar-bench-v2-150）取数链路：RadarService 的读取 / 重试 / 并发 / 缓存，
+// 以及 RadarViewModel 的逐档合并（部分失败不覆盖成功行、换基准作废缓存、后台只补读过期档位、偏好不被刷新重置）。
+// 旧 insights / efficiency / current.json 的 fetch() 契约测试已随该数据源一并替换为下面的新契约测试。
 import XCTest
 @testable import CodexRadar
 
 /// 拦截 URLSession.shared 的请求，按 URL 返回预设的响应或错误，免去给 RadarService 引入依赖注入。
 final class StubURLProtocol: URLProtocol {
     struct Stub {
-        let data: Data
-        let statusCode: Int
+        var data: Data
+        var statusCode: Int
+        var headers: [String: String] = [:]
+        var delay: TimeInterval = 0
     }
 
-    static var stubs: [String: Stub] = [:]
-    static var errors: [String: Error] = [:]
+    private static let lock = NSLock()
+    private static var _stubs: [String: Stub] = [:]
+    private static var _sequences: [String: [Stub]] = [:]
+    private static var _errors: [String: Error] = [:]
+    private static var _log: [(url: String, headers: [String: String])] = []
+    private static var _inFlight = 0
+    private static var _maxInFlight = 0
 
-    /// 实际发起过的请求 URL（startLoading 可能在 URLSession 的内部队列线程上跑，用锁保护）。
-    private static let requestedURLsLock = NSLock()
-    private static var _requestedURLs: [String] = []
-    static var requestedURLs: [String] {
-        requestedURLsLock.lock()
-        defer { requestedURLsLock.unlock() }
-        return _requestedURLs
+    static var stubs: [String: Stub] {
+        get { lock.lock(); defer { lock.unlock() }; return _stubs }
+        set { lock.lock(); _stubs = newValue; lock.unlock() }
     }
+
+    /// 同一 URL 的多次响应按顺序消费，最后一个重复使用（用来模拟「先繁忙后成功」）。
+    static var sequences: [String: [Stub]] {
+        get { lock.lock(); defer { lock.unlock() }; return _sequences }
+        set { lock.lock(); _sequences = newValue; lock.unlock() }
+    }
+
+    static var errors: [String: Error] {
+        get { lock.lock(); defer { lock.unlock() }; return _errors }
+        set { lock.lock(); _errors = newValue; lock.unlock() }
+    }
+
+    /// 实际发起过的请求（URL + 请求头）。
+    static var requestLog: [(url: String, headers: [String: String])] {
+        lock.lock(); defer { lock.unlock() }; return _log
+    }
+    static var requestedURLs: [String] { requestLog.map(\.url) }
+    static var maxInFlight: Int { lock.lock(); defer { lock.unlock() }; return _maxInFlight }
 
     static func reset() {
-        stubs = [:]
-        errors = [:]
-        requestedURLsLock.lock()
-        _requestedURLs = []
-        requestedURLsLock.unlock()
+        lock.lock()
+        _stubs = [:]; _sequences = [:]; _errors = [:]; _log = []; _inFlight = 0; _maxInFlight = 0
+        lock.unlock()
     }
+
+    private static func known(_ url: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _stubs[url] != nil || _sequences[url] != nil || _errors[url] != nil
+    }
+
+    private static func nextStub(for url: String) -> Stub? {
+        lock.lock(); defer { lock.unlock() }
+        if var queue = _sequences[url], !queue.isEmpty {
+            let first = queue[0]
+            if queue.count > 1 { queue.removeFirst(); _sequences[url] = queue }
+            return first
+        }
+        return _stubs[url]
+    }
+
+    private static func begin(_ url: String, headers: [String: String]) {
+        lock.lock()
+        _log.append((url, headers))
+        _inFlight += 1
+        _maxInFlight = max(_maxInFlight, _inFlight)
+        lock.unlock()
+    }
+
+    private static func end() { lock.lock(); _inFlight -= 1; lock.unlock() }
+
+    private static func error(for url: String) -> Error? { lock.lock(); defer { lock.unlock() }; return _errors[url] }
 
     override class func canInit(with request: URLRequest) -> Bool {
         guard let url = request.url else { return false }
-        return stubs[url.absoluteString] != nil || errors[url.absoluteString] != nil
+        return known(url.absoluteString)
     }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         guard let url = request.url else { return }
-        Self.requestedURLsLock.lock()
-        Self._requestedURLs.append(url.absoluteString)
-        Self.requestedURLsLock.unlock()
-        if let error = Self.errors[url.absoluteString] {
+        let key = url.absoluteString
+        Self.begin(key, headers: request.allHTTPHeaderFields ?? [:])
+        if let error = Self.error(for: key) {
+            Self.end()
             client?.urlProtocol(self, didFailWithError: error)
             return
         }
-        guard let stub = Self.stubs[url.absoluteString] else {
+        guard var stub = Self.nextStub(for: key) else {
+            Self.end()
             client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
             return
         }
-        let response = HTTPURLResponse(url: url, statusCode: stub.statusCode, httpVersion: "HTTP/1.1", headerFields: nil)!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: stub.data)
-        client?.urlProtocolDidFinishLoading(self)
+        // 与站点一致：评分接口不带选择头返回 428。
+        if url.path == "/api/radar-bench-score",
+           request.value(forHTTPHeaderField: RadarService.selectionHeaderField) != RadarService.selectionHeaderValue {
+            stub = Stub(data: Data("{}".utf8), statusCode: 428)
+        }
+        let respond = { [self] in
+            let response = HTTPURLResponse(url: url, statusCode: stub.statusCode, httpVersion: "HTTP/1.1", headerFields: stub.headers)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: stub.data)
+            client?.urlProtocolDidFinishLoading(self)
+            Self.end()
+        }
+        if stub.delay > 0 {
+            DispatchQueue.global().asyncAfter(deadline: .now() + stub.delay, execute: respond)
+        } else {
+            respond()
+        }
     }
 
     override func stopLoading() {}
 }
 
+/// 记录 RadarService 的退避 / Retry-After 等待，免去真实睡眠。
+final class SleepRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _values: [TimeInterval] = []
+    var values: [TimeInterval] { lock.lock(); defer { lock.unlock() }; return _values }
+    func record(_ seconds: TimeInterval) { lock.lock(); _values.append(seconds); lock.unlock() }
+}
+
+/// 线程安全的可控时钟，给 RadarService 的共享冷却注入（worker 在多个线程上读写）。
+final class LockedClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+    init(_ value: Date) { self.value = value }
+    var now: Date { lock.lock(); defer { lock.unlock() }; return value }
+    func advance(_ seconds: TimeInterval) { lock.lock(); value = value.addingTimeInterval(seconds); lock.unlock() }
+}
+
+/// 可控等待闸门：sleep 记录时长并挂起，直到测试 `releaseNext()` / `openAll()`；释放时按时长推进时钟。
+/// 任务取消会唤醒挂起的 sleep（与真实 Task.sleep 一致）。没有任何真实睡眠，也不会空转。
+final class ManualSleeper: @unchecked Sendable {
+    private typealias Waiter = (seconds: TimeInterval, continuation: CheckedContinuation<Bool, Never>)
+
+    private let lock = NSLock()
+    private let clock: LockedClock
+    private var recorded: [TimeInterval] = []
+    private var order: [UUID] = []
+    private var waiters: [UUID: Waiter] = [:]
+    private var cancelledEarly = Set<UUID>()
+    private var isOpen = false
+
+    init(clock: LockedClock) { self.clock = clock }
+
+    var values: [TimeInterval] { lock.lock(); defer { lock.unlock() }; return recorded }
+    var waitingCount: Int { lock.lock(); defer { lock.unlock() }; return waiters.count }
+
+    func sleep(_ seconds: TimeInterval) async {
+        if recordAndCheckOpen(seconds) { clock.advance(seconds); return }
+        let id = UUID()
+        let released = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                register(id, seconds, continuation)
+            }
+        } onCancel: {
+            self.cancel(id)
+        }
+        if released { clock.advance(seconds) }
+    }
+
+    /// 放行最早挂起的一个 sleep。
+    func releaseNext() {
+        lock.lock()
+        var next: Waiter?
+        while !order.isEmpty, next == nil { next = waiters.removeValue(forKey: order.removeFirst()) }
+        lock.unlock()
+        next?.continuation.resume(returning: true)
+    }
+
+    /// 之后所有 sleep（含已挂起的）都立即返回；用于测试收尾，保证批次一定能结束。
+    func openAll() {
+        lock.lock()
+        isOpen = true
+        let all = Array(waiters.values)
+        waiters = [:]; order = []
+        lock.unlock()
+        all.forEach { $0.continuation.resume(returning: true) }
+    }
+
+    private func recordAndCheckOpen(_ seconds: TimeInterval) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        recorded.append(seconds)
+        return isOpen
+    }
+
+    private func register(_ id: UUID, _ seconds: TimeInterval, _ continuation: CheckedContinuation<Bool, Never>) {
+        lock.lock()
+        if cancelledEarly.contains(id) {
+            lock.unlock(); continuation.resume(returning: false)
+        } else if isOpen {
+            lock.unlock(); continuation.resume(returning: true)
+        } else {
+            order.append(id); waiters[id] = (seconds, continuation)
+            lock.unlock()
+        }
+    }
+
+    private func cancel(_ id: UUID) {
+        lock.lock()
+        let waiter = waiters.removeValue(forKey: id)
+        order.removeAll { $0 == id }
+        if waiter == nil { cancelledEarly.insert(id) }
+        lock.unlock()
+        waiter?.continuation.resume(returning: false)
+    }
+}
+
+/// 线程安全的回调记录（onResult 在 MainActor 上，断言在测试线程上）。
+final class BatchResultLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _entries: [(id: String, success: Bool)] = []
+    var entries: [(id: String, success: Bool)] { lock.lock(); defer { lock.unlock() }; return _entries }
+    func record(_ id: String, success: Bool) { lock.lock(); _entries.append((id, success)); lock.unlock() }
+}
+
+/// 可手动拨动的时钟（ViewModel 的 now 注入）。
+final class TestClock: @unchecked Sendable {
+    var now: Date
+    init(_ now: Date) { self.now = now }
+    func advance(_ seconds: TimeInterval) { now = now.addingTimeInterval(seconds) }
+}
+
+/// 2026-10-18 站点现行契约的测试夹具。`realSummaryJSON` 是线上 gpt-6.1-sol / medium 的真实响应原文
+/// （含 79/80 费用样本、微秒级 latest_graded_at、history 等），其余档位由它改写 model/effort/score 等字段得到。
+enum BenchFixtures {
+    static let benchmark = "radar-bench-final64-20261004"
+    static let catalog = "dradar-four-library-deployment007-server024-20261004-config64"
+    static let sha = "f75ff09b6117cd83d3ab6ea744fe379ac117676c042538d5df5e38489af27bc4"
+
+    static let layout: [(model: String, efforts: [String])] = [
+        ("gpt-6.1-sol", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+        ("gpt-6-astra", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+        ("gpt-6-sol", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+        ("gpt-6-luna", ["low", "medium", "high", "xhigh", "max"]),
+        ("gpt-5.6-sol", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+        ("gpt-5.6-luna", ["low", "medium", "high", "xhigh", "max"]),
+    ]
+    static var selections: [BenchSelection] {
+        layout.flatMap { item in item.efforts.map { BenchSelection(model: item.model, effort: $0) } }
+    }
+
+    static let realSummaryJSON = #"""
+{"schema":"radar-bench-public-summary-v6-150-details","benchmark":"radar-bench-final64-20261004","score_version":"radar-bench-v2-150","score_max":150,"catalog_version":"dradar-four-library-deployment007-server024-20261004-config64","task_set_sha256":"f75ff09b6117cd83d3ab6ea744fe379ac117676c042538d5df5e38489af27bc4","model":"gpt-6.1-sol","effort":"medium","score":78.2121020962733,"coverage":64,"required_tasks":64,"score_status":"complete","graded_runs_count":80,"source_counts":{"deepswe":15,"pompeii":16,"tb4":14,"science":19},"scoring_policy_version":"radar-bench-v2-last3-per-task-equal-weight-150","source_scores":{"deepswe":{"score":100,"coverage":15,"required_tasks":15,"graded_runs_count":22},"pompeii":{"score":120.66090838509317,"coverage":16,"required_tasks":16,"graded_runs_count":16},"tb4":{"score":69.64285714285714,"coverage":14,"required_tasks":14,"graded_runs_count":20},"science":{"score":31.57894736842105,"coverage":19,"required_tasks":19,"graded_runs_count":22}},"statistics":{"sample_count":80,"cost_basis":"official_standard_api_equivalent; no estimates or claimed cash charges","metrics":{"elapsed_ms":{"total":47805382.86827114,"mean":597567.2858533893,"known_total":47805382.86827114,"known_samples":80,"missing_samples":0,"missing_reason":null},"api_equivalent_usd":{"total":null,"mean":null,"known_total":28.957456,"known_samples":79,"missing_samples":1,"missing_reason":"source_evidence_incomplete"}}},"statistics_state":"available","detail_metrics":{"valid_grade_events":80,"latest_graded_at":"2026-10-18T00:59:23.459695Z","as_of":"2026-10-18T07:23:00.209Z","graded_24h":4,"graded_48h":13,"metrics":{"total_tokens":{"known_total":90393953,"known_samples":79,"missing_samples":1},"input_tokens":{"known_total":89346730,"known_samples":79,"missing_samples":1},"output_tokens":{"known_total":1047223,"known_samples":79,"missing_samples":1},"cache_tokens":{"known_total":84320128,"known_samples":79,"missing_samples":1},"reasoning_tokens":{"known_total":407768,"known_samples":79,"missing_samples":1},"cache_write_tokens":{"known_total":0,"known_samples":79,"missing_samples":1},"turn_count":{"known_total":79,"known_samples":79,"missing_samples":1}},"metrics_state":"available"},"history":{"schema":"radar-bench-public-history-v1-150-daily","score_version":"radar-bench-v2-150","score_max":150,"model":"gpt-6.1-sol","effort":"medium","time_zone":"UTC","bucket":"day","basis":"last canonical score per UTC grading day; days without grades omitted","updated_bucket":"2026-10-18T00:00:00.000Z","points":[{"at":"2026-10-06T00:00:00.000Z","score":0,"coverage":1,"required_tasks":64,"score_status":"provisional"},{"at":"2026-10-09T00:00:00.000Z","score":76.91535461505127,"coverage":43,"required_tasks":64,"score_status":"provisional"},{"at":"2026-10-10T00:00:00.000Z","score":76.83022774327122,"coverage":45,"required_tasks":64,"score_status":"provisional"},{"at":"2026-10-11T00:00:00.000Z","score":78.34809039249373,"coverage":47,"required_tasks":64,"score_status":"provisional"},{"at":"2026-10-13T00:00:00.000Z","score":75.14431859700402,"coverage":51,"required_tasks":64,"score_status":"provisional"},{"at":"2026-10-14T00:00:00.000Z","score":76.58385093167702,"coverage":52,"required_tasks":64,"score_status":"provisional"},{"at":"2026-10-15T00:00:00.000Z","score":75.13630089717046,"coverage":54,"required_tasks":64,"score_status":"provisional"},{"at":"2026-10-16T00:00:00.000Z","score":78.94935884592265,"coverage":62,"required_tasks":64,"score_status":"provisional"},{"at":"2026-10-17T00:00:00.000Z","score":79.3839770962733,"coverage":64,"required_tasks":64,"score_status":"complete"},{"at":"2026-10-18T00:00:00.000Z","score":78.2121020962733,"coverage":64,"required_tasks":64,"score_status":"complete"}]},"history_state":"available"}
+"""#
+
+    static func realSummaryObject() -> [String: Any] {
+        try! JSONSerialization.jsonObject(with: Data(realSummaryJSON.utf8)) as! [String: Any]
+    }
+
+    static func bindingData(
+        benchmark: String = benchmark, sha: String = sha, enabled: Bool = true, verified: Bool = true,
+        selections: [BenchSelection] = selections, extra: [String: Any] = [:]
+    ) -> Data {
+        var object: [String: Any] = [
+            "enabled": enabled, "interface_confirmed": true, "production_read_verified": verified,
+            "active_display_selection": ["model": "gpt-6.1-sol", "effort": "low"],
+            "transport_origin": "https://api.codexradar.com", "endpoint_path": "/api/v1/radar-bench-score",
+            "benchmark": benchmark, "catalog_version": catalog, "task_set_sha256": sha,
+            "total_tasks": 64, "total_cells": 320,
+            "source_counts": ["deepswe": 15, "pompeii": 16, "tb4": 14, "science": 19],
+            "model_efforts": selections.map { ["model": $0.model, "effort": $0.effort] },
+            "members": [["source_benchmark": "deepswe15-20261003-v4", "collection_id": "deepswe", "task_id": "igel-persist-feature-schema"]],
+            "score_version": "radar-bench-v2-150", "score_max": 150,
+        ]
+        for (key, value) in extra { object[key] = value }
+        return try! JSONSerialization.data(withJSONObject: object)
+    }
+
+    /// 由真实样本改写出某档位的成绩响应。`score` 传 NSNull() 表示 null。
+    static func summaryObject(
+        _ selection: BenchSelection, score: Any = 90.0, coverage: Int = 64, status: String = "complete",
+        costKnown: Int = 80, costMissing: Int = 0, costTotal: Double = 28.0,
+        sha: String = sha, benchmark: String = benchmark
+    ) -> [String: Any] {
+        var object = realSummaryObject()
+        object["model"] = selection.model
+        object["effort"] = selection.effort
+        object["score"] = score
+        object["coverage"] = coverage
+        object["score_status"] = status
+        object["task_set_sha256"] = sha
+        object["benchmark"] = benchmark
+        var statistics = object["statistics"] as! [String: Any]
+        var metrics = statistics["metrics"] as! [String: Any]
+        metrics["api_equivalent_usd"] = [
+            "total": costMissing == 0 ? costTotal : NSNull(),
+            "mean": costMissing == 0 ? costTotal / Double(max(costKnown, 1)) : NSNull(),
+            "known_total": costTotal, "known_samples": costKnown, "missing_samples": costMissing,
+            "missing_reason": costMissing == 0 ? NSNull() : "source_evidence_incomplete",
+        ] as [String: Any]
+        statistics["metrics"] = metrics
+        object["statistics"] = statistics
+        return object
+    }
+
+    static func summaryData(_ selection: BenchSelection, score: Any = 90.0, coverage: Int = 64, status: String = "complete",
+                            costKnown: Int = 80, costMissing: Int = 0, costTotal: Double = 28.0,
+                            sha: String = sha, benchmark: String = benchmark) -> Data {
+        let object = summaryObject(selection, score: score, coverage: coverage, status: status,
+                                   costKnown: costKnown, costMissing: costMissing, costTotal: costTotal,
+                                   sha: sha, benchmark: benchmark)
+        return try! JSONSerialization.data(withJSONObject: object)
+    }
+
+    /// 默认分数：按绑定顺序递减（第一个 = gpt-6.1-sol/low 为最高分）。
+    static func defaultScore(_ selection: BenchSelection) -> Double {
+        let index = selections.firstIndex(of: selection) ?? 0
+        return 120 - Double(index) * 2
+    }
+
+    static let t0 = ISO8601DateFormatter().date(from: "2026-10-18T12:00:00Z")!
+}
+
 final class RadarServiceTests: XCTestCase {
 
-    private let codexJSON = """
-    {
-      "model_iq": {
-        "latest": {
-          "score": 50.0, "passed": 4, "tasks": 12,
-          "wall_seconds": 1483, "model": "gpt-5.5", "reasoning_effort": "xhigh",
-          "cost_usd": 41.405896
-        },
-        "quota_radar": { "updated_at": "2026-06-26T05:44:34Z" }
-      }
-    }
-    """
-
-    private let insightsJSON = """
-    {
-      "schema": 1,
-      "source_updated_at": "2026-07-26T10:00:00Z",
-      "recommendations": [
-        {"key": "daily_development", "title": "日常开发", "items": [
-          {"model": "gpt-5.5", "effort": "medium", "iq": 87.0, "combined_cost_index": 0.27}
-        ]}
-      ]
-    }
-    """
-
-    private let efficiencyJSON = """
-    {
-      "schema": 2,
-      "source_updated_at": "2026-07-26T09:00:00Z",
-      "points": [
-        {"model": "gpt-5.5", "effort": "medium", "iq": 87.0, "passed": 7, "valid_tasks": 12,
-         "average_price_usd": 23.9, "average_minutes": 85.0, "combined_cost_index": 0.27},
-        {"model": "gpt-5.4", "effort": "xhigh", "iq": 101.0, "passed": 8, "valid_tasks": 12,
-         "average_price_usd": 23.4, "average_minutes": 246.0, "combined_cost_index": 0.23}
-      ]
-    }
-    """
+    private var sleeps: SleepRecorder!
+    private var serviceClock: LockedClock!
+    private var suiteNames: [String] = []
 
     override func setUp() {
         super.setUp()
         URLProtocol.registerClass(StubURLProtocol.self)
+        sleeps = SleepRecorder()
+        serviceClock = LockedClock(BenchFixtures.t0)
     }
 
     override func tearDown() {
         URLProtocol.unregisterClass(StubURLProtocol.self)
         StubURLProtocol.reset()
+        suiteNames.forEach { UserDefaults(suiteName: $0)?.removePersistentDomain(forName: $0) }
+        suiteNames = []
         super.tearDown()
     }
 
-    /// 给全部三个源设置默认失败，逐个测试再按需覆盖，避免真实网络请求。
-    private func failAll(_ service: RadarService) {
-        for url in [service.insightsURL, service.efficiencyURL, service.jsonURL] {
-            StubURLProtocol.errors[url.absoluteString] = URLError(.timedOut)
+    /// 记录型 sleep 同时推进可控时钟：共享冷却按这条时钟计算，等待立即返回但冷却确实走完。
+    private func makeService() -> RadarService {
+        let recorder = sleeps!, clock = serviceClock!
+        return RadarService(sleep: { recorder.record($0); clock.advance($0) }, now: { clock.now })
+    }
+
+    /// 等待由测试闸门控制的服务（释放前不会继续，也不依赖真实时间流逝）。
+    private func makeGatedService(_ sleeper: ManualSleeper) -> RadarService {
+        let clock = serviceClock!
+        return RadarService(sleep: { await sleeper.sleep($0) }, now: { clock.now })
+    }
+
+    /// 有限时长轮询（只用于等 worker 进入挂起点，超时即失败，绝不无限等待）。
+    private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { return false }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return true
+    }
+
+    private func requestCount(_ url: URL) -> Int {
+        StubURLProtocol.requestedURLs.filter { $0 == url.absoluteString }.count
+    }
+
+    private func isolatedDefaults() -> UserDefaults {
+        let name = "codexradar.tests.\(UUID().uuidString)"
+        suiteNames.append(name)
+        return UserDefaults(suiteName: name)!
+    }
+
+    /// 绑定 + 全部 34 档成功（默认分数递减）。
+    private func stubHappyPath(_ service: RadarService, binding: Data = BenchFixtures.bindingData()) {
+        StubURLProtocol.stubs[service.bindingURL.absoluteString] = .init(data: binding, statusCode: 200)
+        for selection in BenchFixtures.selections {
+            StubURLProtocol.stubs[service.scoreURL(for: selection).absoluteString] =
+                .init(data: BenchFixtures.summaryData(selection, score: BenchFixtures.defaultScore(selection)), statusCode: 200)
         }
     }
 
-    // MARK: - 只使用 codexradar.com：不再请求 claudecoderadar.com
-
-    /// RadarService 只暴露三个 URL，且全部指向 codexradar.com——不存在指向其它域名的属性，
-    /// 也就不存在可以对其发起请求的入口。
-    func testServiceExposesOnlyCodexRadarURLs() {
-        let service = RadarService()
-        for url in [service.insightsURL, service.efficiencyURL, service.jsonURL] {
-            XCTAssertEqual(url.host, "codexradar.com", "\(url) 不应指向 codexradar.com 之外的域名")
-        }
+    private func scoreRequestCount() -> Int {
+        StubURLProtocol.requestedURLs.filter { $0.contains("/api/radar-bench-score") }.count
     }
 
-    /// 回归：即使环境里仍留有 claudecoderadar.com 的可用 stub（模拟旧代码残留场景），
-    /// fetch() 也绝不能请求它——Claude Code 分区必须只从 codexradar 的 claude-* 竞品条目里取数据，
-    /// 混入 claudecoderadar 的数据（这里用一个明显不同的 iq=999 探测）就说明代码又悄悄发起了该请求。
-    func testFetch_neverRequestsClaudeRadarDotCom_evenWhenStubExists() async throws {
-        let service = RadarService()
-        failAll(service)
-        StubURLProtocol.errors[service.efficiencyURL.absoluteString] = nil
-        let metricsWithClaudeEntry = """
-        {"schema":3,"points":[
-          {"model":"claude-opus-5","effort":"high","iq":108.5,"passed":9,"total":12,
-           "average_price_usd":60.0,"average_minutes":200.0,"combined_cost_index":0.55}
-        ]}
-        """
-        StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = .init(data: Data(metricsWithClaudeEntry.utf8), statusCode: 200)
-
-        let legacyClaudeURL = "https://claudecoderadar.com/data/claude-code-radar.json"
-        let legacyClaudeJSON = """
-        {"iq":{"models":[
-          {"name":"Opus 5","iq":[999.0],"pass":[9.0],"valid":[12.0],"cost":[1.0],"time":[0.1]}
-        ]}}
-        """
-        StubURLProtocol.stubs[legacyClaudeURL] = .init(data: Data(legacyClaudeJSON.utf8), statusCode: 200)
-
-        let snapshot = try await service.fetch()
-
-        // 直接断言请求记录：即使 legacyClaudeURL 的 stub 就摆在那儿（StubURLProtocol.canInit
-        // 会接受它），fetch() 也绝不能真正发起过这个请求——只断言结果里没混入 iq=999 不够，
-        // 那也可能是「请求了但没用返回值」这种同样错误但会被结果断言放过的实现。
-        XCTAssertFalse(StubURLProtocol.requestedURLs.contains(legacyClaudeURL),
-                        "fetch() 不应向 claudecoderadar.com 发起任何请求")
-        XCTAssertTrue(StubURLProtocol.requestedURLs.contains(service.efficiencyURL.absoluteString),
-                      "sanity check：efficiency 源确实被请求过，说明上面的断言不是因为请求全没发出去")
-
-        // Claude Code 分区只应有 codexradar 的 claude-opus-5 一条（重命名为 opus-5/high，
-        // metricSource == .codexRadar）；iq=999 的 claudecoderadar 数据绝不能出现。
-        XCTAssertEqual(snapshot.claudeGroup.map(\.id), ["opus-5/high"])
-        XCTAssertEqual(snapshot.claudeGroup.first?.result.metricSource, .codexRadar)
-        XCTAssertEqual(snapshot.claudeGroup.first?.result.iq, 108.5)
-    }
-
-    func testFetch_primarySourcesSucceed_currentJSONFails_stillReturnsWebsiteData() async throws {
-        let service = RadarService()
-        failAll(service)
-        StubURLProtocol.errors[service.insightsURL.absoluteString] = nil
-        StubURLProtocol.errors[service.efficiencyURL.absoluteString] = nil
-        StubURLProtocol.stubs[service.insightsURL.absoluteString] = .init(data: Data(insightsJSON.utf8), statusCode: 200)
-        StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = .init(data: Data(efficiencyJSON.utf8), statusCode: 200)
-
-        let snapshot = try await service.fetch()
-
-        XCTAssertEqual(snapshot.codexSource, .website, "expected .website source when insights + efficiency succeed")
-        // 榜单按 IQ 降序（推荐项不置顶）；菜单栏仍跟随 daily_development 第一项
-        XCTAssertEqual(snapshot.codexGroup.map(\.id), ["gpt-5.4/xhigh", "gpt-5.5/medium"])
-        XCTAssertEqual(snapshot.menuBarBest?.id, "gpt-5.5/medium")
-        XCTAssertEqual(snapshot.insights.map(\.key), ["daily_development"])
-        // 时间戳取 insights 的 source_updated_at
-        XCTAssertEqual(snapshot.updatedAt, RadarParser.parseISO("2026-07-26T10:00:00Z"))
-    }
-
-    func testFetch_emptyDailyGroupUsesWebsiteSupplementAndRecommendsSolMedium() async throws {
-        let service = RadarService()
-        failAll(service)
-        let liveInsights = """
-        {
-          "schema": 1,
-          "source_updated_at": "2026-08-29T07:42:09Z",
-          "comprehensive_points": [
-            {"model":"gpt-5.6-sol","effort":"medium","iq":92.44},
-            {"model":"gpt-5.6-sol","effort":"ultra","iq":102.92},
-            {"model":"gpt-5.5","effort":"high","iq":92.37}
-          ],
-          "recommendations": [
-            {"key":"daily_development","title":"日常开发","items":[]},
-            {"key":"hard_problems","title":"难题攻坚","items":[
-              {"model":"gpt-5.6-sol","effort":"ultra","iq":102.92}
-            ]}
-          ]
-        }
-        """
-        let liveMetrics = """
-        {"schema":3,"source_updated_at":"2026-08-29T07:55:22Z","points":[
-          {"model":"gpt-5.6-sol","effort":"medium","iq":95.09,"passed":204,"total":336,
-           "average_price_usd":3.105691,"average_minutes":16.77,"combined_cost_index":1505.18},
-          {"model":"gpt-5.6-sol","effort":"ultra","iq":100.89,"passed":226,"total":336,
-           "average_price_usd":24.691531,"average_minutes":51.96,"combined_cost_index":378162.861},
-          {"model":"gpt-5.5","effort":"high","iq":91.07,"passed":204,"total":336,
-           "average_price_usd":3.687197,"average_minutes":16.98,"combined_cost_index":1856.189}
-        ]}
-        """
-        StubURLProtocol.errors[service.insightsURL.absoluteString] = nil
-        StubURLProtocol.errors[service.efficiencyURL.absoluteString] = nil
-        StubURLProtocol.stubs[service.insightsURL.absoluteString] = .init(data: Data(liveInsights.utf8), statusCode: 200)
-        StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = .init(data: Data(liveMetrics.utf8), statusCode: 200)
-
-        let snapshot = try await service.fetch()
-
-        XCTAssertEqual(snapshot.insights.first?.items.map(\.id), ["gpt-5.6-sol/medium", "gpt-5.5/high"])
-        XCTAssertEqual(snapshot.menuBarBest?.id, "gpt-5.6-sol/medium")
-    }
-
-    func testFetch_primarySourcesFail_fallsBackToCurrentJSONLocalEstimate() async throws {
-        let service = RadarService()
-        failAll(service)
-        StubURLProtocol.errors[service.jsonURL.absoluteString] = nil
-        StubURLProtocol.stubs[service.jsonURL.absoluteString] = .init(data: Data(codexJSON.utf8), statusCode: 200)
-
-        let snapshot = try await service.fetch()
-
-        XCTAssertEqual(snapshot.codexSource, .localEstimate, "expected .localEstimate fallback when primary sources fail")
-        XCTAssertFalse(snapshot.codexGroup.isEmpty)
-        XCTAssertTrue(snapshot.insights.isEmpty)
-        XCTAssertEqual(snapshot.menuBarBest?.id, "gpt-5.5/xhigh")
-        XCTAssertEqual(snapshot.updatedAt, RadarParser.parseISO("2026-06-26T05:44:34Z"))
-    }
-
-    /// efficiency 数据里没有任何 `claude-*` 前缀条目（Claude Code 分区的唯一数据来源）时，
-    /// 该分区必须判为不可用，不能影响 Codex 组本身。
-    func testFetch_efficiencySucceeds_noClaudeEntries_marksClaudeUnavailable() async throws {
-        let service = RadarService()
-        failAll(service)
-        StubURLProtocol.errors[service.insightsURL.absoluteString] = nil
-        StubURLProtocol.errors[service.efficiencyURL.absoluteString] = nil
-        StubURLProtocol.stubs[service.insightsURL.absoluteString] = .init(data: Data(insightsJSON.utf8), statusCode: 200)
-        StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = .init(data: Data(efficiencyJSON.utf8), statusCode: 200)
-
-        let snapshot = try await service.fetch()
-
-        XCTAssertFalse(snapshot.codexGroup.isEmpty)
-        XCTAssertTrue(snapshot.claudeGroup.isEmpty)
-        switch snapshot.claudeStatus {
-        case .unavailable: break
-        case .ok: XCTFail("expected claudeStatus to be .unavailable when no claude-* entries are present")
-        }
-    }
-
-    func testFetch_allCodexSourcesFail_throws() async throws {
-        let service = RadarService()
-        failAll(service)
-
-        do {
-            _ = try await service.fetch()
-            XCTFail("expected fetch() to throw when all Codex sources fail")
-        } catch {
-            // insights/efficiency/current.json 全部失败必须致命，不能静默返回空快照。
-        }
-    }
-
-    // MARK: - 部分成功降级
-
-    func testFetch_insightsOnly_currentFails_marksRecommendationsOnlyFallback() async throws {
-        let service = RadarService()
-        failAll(service)
-        StubURLProtocol.errors[service.insightsURL.absoluteString] = nil
-        StubURLProtocol.stubs[service.insightsURL.absoluteString] = .init(data: Data(insightsJSON.utf8), statusCode: 200)
-
-        let snapshot = try await service.fetch()
-
-        XCTAssertEqual(snapshot.codexSource, .recommendationsOnly, "efficiency 与 current.json 都不可用时应标为最小兜底档")
-        XCTAssertEqual(snapshot.insights.map(\.key), ["daily_development"])
-        // 从 insight items 构建的列表，菜单栏跟 daily 首项
-        XCTAssertEqual(snapshot.codexGroup.map(\.id), ["gpt-5.5/medium"])
-        XCTAssertEqual(snapshot.menuBarBest?.id, "gpt-5.5/medium")
-        XCTAssertEqual(snapshot.codexGroup.first?.recommendedIn, ["日常开发"])
-    }
-
-    func testFetch_efficiencyOnly_currentAvailable_keepsWebsiteOrderMenuBarMatchesLocalChampion() async throws {
-        let service = RadarService()
-        failAll(service)
-        StubURLProtocol.errors[service.efficiencyURL.absoluteString] = nil
-        StubURLProtocol.errors[service.jsonURL.absoluteString] = nil
-        StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = .init(data: Data(efficiencyJSON.utf8), statusCode: 200)
-        // current.json 唯一配置 = gpt-5.5/medium → 本地冠军 identity
-        let currentJSON = """
-        {
-          "model_iq": {
-            "latest": {
-              "score": 87.0, "passed": 7, "tasks": 12,
-              "wall_seconds": 5100, "model": "gpt-5.5", "reasoning_effort": "medium",
-              "cost_usd": 23.9
-            }
-          }
-        }
-        """
-        StubURLProtocol.stubs[service.jsonURL.absoluteString] = .init(data: Data(currentJSON.utf8), statusCode: 200)
-
-        let snapshot = try await service.fetch()
-
-        XCTAssertEqual(snapshot.codexSource, .website, "efficiency-only 仍应为 .website")
-        // 列表保持网站排序（无推荐 → 按 IQ 降序），本地公式不改变排序
-        XCTAssertEqual(snapshot.codexGroup.map(\.id), ["gpt-5.4/xhigh", "gpt-5.5/medium"])
-        XCTAssertTrue(snapshot.codexGroup.allSatisfy { $0.recommendedIn.isEmpty })
-        // 菜单栏匹配本地冠军 identity，而非网站列表第一项
-        XCTAssertEqual(snapshot.menuBarBest?.id, "gpt-5.5/medium")
-    }
-
-    func testFetch_efficiencyOnly_currentUnavailable_menuBarFallsBackToFirstWebsiteItem() async throws {
-        let service = RadarService()
-        failAll(service)
-        StubURLProtocol.errors[service.efficiencyURL.absoluteString] = nil
-        StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = .init(data: Data(efficiencyJSON.utf8), statusCode: 200)
-
-        let snapshot = try await service.fetch()
-
-        XCTAssertEqual(snapshot.codexGroup.map(\.id), ["gpt-5.4/xhigh", "gpt-5.5/medium"])
-        XCTAssertEqual(snapshot.menuBarBest?.id, "gpt-5.4/xhigh")
-    }
-
-    // MARK: - 多厂商端到端：真实 schema 3 数据，原始数据不丢模型，展示层只保留白名单厂商
-
-    /// 复刻线上 2026-09-06 前后 intelligence-efficiency-metrics 的真实返回：
-    /// schema 3，混合 OpenAI/xAI/DeepSeek/Anthropic 命名模型，端到端验证 snapshot.all/codexGroup
-    /// 权威数据不丢模型、不重复；展示层（codexGroupsByVendor）只保留白名单厂商 OpenAI/Grok/DeepSeek，
-    /// Anthropic/Claude 命名的竞品条目整体从 Codex 展示中剔除。
-    func testFetch_liveSchema3MultiVendorEfficiency_populatesAllVendorGroupsWithoutDroppingOrDuplicating() async throws {
-        let service = RadarService()
-        failAll(service)
-        let multiVendorMetrics = """
-        {"schema":3,"source_updated_at":"2026-09-06T08:00:00Z","points":[
-          {"model":"gpt-6-astra","effort":"high","iq":112.4,"passed":9,"total":12,
-           "average_price_usd":31.2,"average_minutes":90.0,"combined_cost_index":0.31},
-          {"model":"gpt-5.6-sol","effort":"medium","iq":95.09,"passed":204,"total":336,
-           "average_price_usd":3.105691,"average_minutes":16.77,"combined_cost_index":1505.18},
-          {"model":"grok-4.6","effort":"high","iq":98.2,"passed":8,"total":20,
-           "average_price_usd":18.4,"average_minutes":60.0,"combined_cost_index":0.29},
-          {"model":"deepseek-v4-turbo","effort":"high","iq":90.1,"passed":7,"total":20,
-           "average_price_usd":5.2,"average_minutes":70.0,"combined_cost_index":0.12},
-          {"model":"claude-opus-5","effort":"high","iq":108.5,"passed":9,"total":12,
-           "average_price_usd":60.0,"average_minutes":200.0,"combined_cost_index":0.55},
-          {"model":"claude-sonnet-5","effort":"medium","iq":97.3,"passed":8,"total":12,
-           "average_price_usd":20.0,"average_minutes":80.0,"combined_cost_index":0.20}
-        ]}
-        """
-        StubURLProtocol.errors[service.efficiencyURL.absoluteString] = nil
-        StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = .init(data: Data(multiVendorMetrics.utf8), statusCode: 200)
-
-        let snapshot = try await service.fetch()
-
-        // 非 Anthropic 的 Codex 侧模型必须都在，不因厂商未知/非 GPT 被丢弃；
-        // claude-* 条目已由解析层搬进 Claude Code 分区，不再留在 codexGroup。
-        XCTAssertEqual(
-            Set(snapshot.codexGroup.map(\.result.name)),
-            Set(["gpt-6-astra", "gpt-5.6-sol", "grok-4.6", "deepseek-v4-turbo"])
-        )
-        // 展示层：白名单固定为 OpenAI/Grok/DeepSeek 三组，顺序固定；Anthropic/Claude 命名条目
-        // 整体不展示（不再有 .anthropic 分组，也不落入"其他"）。
-        XCTAssertEqual(snapshot.codexGroupsByVendor.map(\.vendor), [.openai, .xai, .deepseek])
-        XCTAssertEqual(
-            snapshot.codexGroupsByVendor.first { $0.vendor == .openai }?.models.map(\.result.name).sorted(),
-            ["gpt-5.6-sol", "gpt-6-astra"]
-        )
-        XCTAssertEqual(snapshot.codexGroupsByVendor.first { $0.vendor == .xai }?.models.map(\.result.name), ["grok-4.6"])
-        XCTAssertEqual(snapshot.codexGroupsByVendor.first { $0.vendor == .deepseek }?.models.map(\.result.name), ["deepseek-v4-turbo"])
-        XCTAssertNil(
-            snapshot.codexGroupsByVendor.first { $0.models.map(\.result.name).contains(where: { $0.hasPrefix("claude-") }) }
-        )
-        // Codex 侧的 claude-* 条目并入 Claude Code 分区：去掉 claude- 前缀，按 IQ 降序；
-        // 不再有独立的 claudecoderadar 雷达数据，Claude Code 分区完全来自这批竞品条目。
-        XCTAssertEqual(
-            snapshot.claudeGroup.map(\.id),
-            ["opus-5/high", "sonnet-5/medium"]
-        )
-        // 来源标记全部为 .codexRadar：不再请求 claudecoderadar.com，claudeRadar 来源不会出现。
-        XCTAssertTrue(snapshot.claudeGroup.allSatisfy { $0.result.metricSource == .codexRadar })
-        switch snapshot.claudeStatus {
-        case .ok: break
-        case .unavailable: XCTFail("expected claudeStatus to be .ok when codexradar has claude-* entries")
-        }
-        // 菜单栏仍只推荐 GPT 型号，即便 Grok/Claude 分数更高。
-        XCTAssertTrue(snapshot.menuBarBest?.result.isGPTModel ?? false)
-    }
-
-    // MARK: - 回归：efficiency 不可用时榜单不得塌缩成两三行
-
-    /// 复刻线上 2026-09-06 的故障现场：intelligence-efficiency-metrics 不可用，而 radar-insights
-    /// 只返回极少数推荐条目（daily_development / hard_problems 为空）。旧实现直接拿推荐条目建列表，
-    /// 弹窗里 OpenAI 组只剩两行；现在应回退到 current.json 的完整候选列表（标注「本地估算」），
-    /// 并把站长推荐合并到匹配条目上、提到最前。
-    func testFetch_efficiencyFails_insightsSparse_usesFullLocalListInsteadOfCollapsingToRecommendations() async throws {
-        let service = RadarService()
-        failAll(service)
-        let sparseInsights = """
-        {
-          "schema": 1,
-          "source_updated_at": "2026-09-06T07:19:00Z",
-          "recommendations": [
-            {"key":"daily_development","title":"日常开发","items":[]},
-            {"key":"hard_problems","title":"难题攻坚","items":[]},
-            {"key":"background_automation","title":"后台自动化","items":[
-              {"model":"gpt-5.6-luna","effort":"high","iq":80.02}
-            ]},
-            {"key":"lobster_tasks","title":"跑龙虾类任务","items":[
-              {"model":"gpt-5.6-terra","effort":"low","iq":61.59},
-              {"model":"gpt-5.6-terra","effort":"medium","iq":67.75}
-            ]}
-          ]
-        }
-        """
-        let currentJSON = """
-        {
-          "model_iq": {
-            "latest": {
-              "score": 106.7, "passed": 239, "tasks": 336,
-              "wall_seconds": 2035, "model": "gpt-5.6-sol", "reasoning_effort": "max",
-              "cost_usd": 7.97
-            },
-            "comparisons": {
-              "gpt_56_sol_medium": {"latest": {
-                "score": 94.2, "passed": 211, "tasks": 336,
-                "wall_seconds": 965, "model": "gpt-5.6-sol", "reasoning_effort": "medium",
-                "cost_usd": 2.94}},
-              "gpt_56_luna_high": {"latest": {
-                "score": 76.34, "passed": 171, "tasks": 336,
-                "wall_seconds": 1060, "model": "gpt-5.6-luna", "reasoning_effort": "high",
-                "cost_usd": 0.21}},
-              "gpt_56_terra_high": {"latest": {
-                "score": 77.68, "passed": 174, "tasks": 336,
-                "wall_seconds": 824, "model": "gpt-5.6-terra", "reasoning_effort": "high",
-                "cost_usd": 1.08}},
-              "gpt_55_high": {"latest": {
-                "score": 90.18, "passed": 202, "tasks": 336,
-                "wall_seconds": 998, "model": "gpt-5.5", "reasoning_effort": "high",
-                "cost_usd": 3.77}}
-            },
-            "quota_radar": {"updated_at": "2026-09-06T07:00:00Z"}
-          }
-        }
-        """
-        StubURLProtocol.errors[service.insightsURL.absoluteString] = nil
-        StubURLProtocol.errors[service.jsonURL.absoluteString] = nil
-        StubURLProtocol.stubs[service.insightsURL.absoluteString] = .init(data: Data(sparseInsights.utf8), statusCode: 200)
-        StubURLProtocol.stubs[service.jsonURL.absoluteString] = .init(data: Data(currentJSON.utf8), statusCode: 200)
-
-        let snapshot = try await service.fetch()
-
-        // 回退到本地估算，UI 会明确标注，不再冒充网站权威指标。
-        XCTAssertEqual(snapshot.codexSource, .localEstimate, "efficiency 不可用时应回退 current.json 本地估算列表")
-        // 核心回归点：OpenAI 展示组必须是完整候选列表，而不是推荐条目的两行。
-        let openai = snapshot.codexGroupsByVendor.first { $0.vendor == .openai }
-        XCTAssertEqual(openai?.models.count, 5)
-        XCTAssertEqual(
-            Set(snapshot.codexGroup.map(\.id)),
-            Set(["gpt-5.6-sol/max", "gpt-5.6-sol/medium", "gpt-5.6-luna/high", "gpt-5.6-terra/high", "gpt-5.5/high"])
-        )
-        // 站长推荐仍然生效：命中的条目带推荐 chip，并排在列表最前。
-        XCTAssertEqual(snapshot.codexGroup.first?.id, "gpt-5.6-luna/high")
-        XCTAssertEqual(snapshot.codexGroup.first?.recommendedIn, ["后台自动化"])
-        XCTAssertEqual(snapshot.insights.map(\.key), ["background_automation", "lobster_tasks"])
-    }
-
-    // MARK: - 回归：权威源掉档时不得覆盖上一次的好快照
-
-    /// 先拿到完整的网站榜单，随后 efficiency 与 current.json 同时不可用（只剩两三条推荐条目）：
-    /// VM 必须保留上一次的好快照，只把头部标成「未更新」，不能把完整榜单换成残缺列表。
     @MainActor
-    func testViewModelRefresh_keepsGoodSnapshot_whenSourcesDegradeToRecommendationsOnly() async {
-        let service = RadarService()
-        failAll(service)
-        StubURLProtocol.errors[service.insightsURL.absoluteString] = nil
-        StubURLProtocol.errors[service.efficiencyURL.absoluteString] = nil
-        StubURLProtocol.stubs[service.insightsURL.absoluteString] = .init(data: Data(insightsJSON.utf8), statusCode: 200)
-        StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = .init(data: Data(efficiencyJSON.utf8), statusCode: 200)
+    private func makeVM(_ service: RadarService, clock: TestClock, defaults: UserDefaults? = nil) -> RadarViewModel {
+        RadarViewModel(service: service, cacheDefaults: defaults ?? isolatedDefaults(), now: { clock.now })
+    }
 
-        let vm = RadarViewModel()
+    // MARK: - URL / 请求形态
+
+    func testServiceOnlyTargetsCodexRadarHostAndScoreURLShape() {
+        let service = RadarService()
+        XCTAssertEqual(service.bindingURL.host, "codexradar.com")
+        XCTAssertEqual(service.bindingURL.path, "/data/radar-bench-binding.json")
+        let url = service.scoreURL(for: BenchSelection(model: "gpt-6.1-sol", effort: "medium"))
+        XCTAssertEqual(url.host, "codexradar.com")
+        XCTAssertEqual(url.absoluteString,
+                       "https://codexradar.com/api/radar-bench-score?model=gpt-6.1-sol&effort=medium&view=summary")
+    }
+
+    func testFetchObservation_sendsSelectionHeader_andParsesRealSample() async throws {
+        let service = makeService()
+        let selection = BenchSelection(model: "gpt-6.1-sol", effort: "medium")
+        StubURLProtocol.stubs[service.scoreURL(for: selection).absoluteString] =
+            .init(data: Data(BenchFixtures.realSummaryJSON.utf8), statusCode: 200)
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+
+        let observation = try await service.fetchObservation(selection, binding: binding)
+
+        let sent = StubURLProtocol.requestLog.first?.headers[RadarService.selectionHeaderField]
+        XCTAssertEqual(sent, "user-selected-v1", "评分接口必须带 X-Radar-Bench-Selection，否则站点返回 428")
+        XCTAssertEqual(observation.score!, 78.2121020962733, accuracy: 1e-9)
+        XCTAssertEqual(observation.coverage, 64)
+    }
+
+    // MARK: - 批量读取：去重 / 并发 ≤ 3 / 重试 / 暂停
+
+    func testFetchBatch_dedupesSelections_andBoundsConcurrencyToThree() async throws {
+        let service = makeService()
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+        let picked = Array(BenchFixtures.selections.prefix(8))
+        for selection in picked {
+            StubURLProtocol.stubs[service.scoreURL(for: selection).absoluteString] =
+                .init(data: BenchFixtures.summaryData(selection), statusCode: 200, delay: 0.08)
+        }
+
+        let outcome = await service.fetchBatch(binding: binding, selections: picked + picked.prefix(4)) { _, _ in }
+
+        XCTAssertEqual(outcome.succeeded, 8)
+        XCTAssertEqual(scoreRequestCount(), 8, "重复档位只请求一次")
+        XCTAssertLessThanOrEqual(StubURLProtocol.maxInFlight, RadarBenchPolicy.concurrency)
+        XCTAssertGreaterThanOrEqual(StubURLProtocol.maxInFlight, 2, "应当确实并发而不是串行")
+    }
+
+    func testFetchBatch_busyResponseRetriesHonoringRetryAfter() async throws {
+        let service = makeService()
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+        let selection = BenchFixtures.selections[0]
+        let url = service.scoreURL(for: selection).absoluteString
+        StubURLProtocol.sequences[url] = [
+            .init(data: Data("busy".utf8), statusCode: 503, headers: ["Retry-After": "7"]),
+            .init(data: BenchFixtures.summaryData(selection), statusCode: 200),
+        ]
+
+        let outcome = await service.fetchBatch(binding: binding, selections: [selection]) { _, _ in }
+
+        XCTAssertEqual(outcome.succeeded, 1)
+        XCTAssertEqual(StubURLProtocol.requestedURLs.filter { $0 == url }.count, 2)
+        XCTAssertEqual(sleeps.values, [7], "必须等满 Retry-After 再重试")
+    }
+
+    func testFetchBatch_retriesAreFinite() async throws {
+        let service = makeService()
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+        let selection = BenchFixtures.selections[0]
+        let url = service.scoreURL(for: selection).absoluteString
+        StubURLProtocol.stubs[url] = .init(data: Data("busy".utf8), statusCode: 502)
+
+        let outcome = await service.fetchBatch(binding: binding, selections: [selection]) { _, _ in }
+
+        XCTAssertEqual(outcome.failed, 1)
+        XCTAssertEqual(StubURLProtocol.requestedURLs.filter { $0 == url }.count, RadarBenchPolicy.maxAttempts)
+        XCTAssertEqual(sleeps.values.count, RadarBenchPolicy.maxAttempts - 1)
+    }
+
+    func testFetchBatch_longRetryAfterPausesWholeBatchWithoutWaiting() async throws {
+        let service = makeService()
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+        let picked = Array(BenchFixtures.selections.prefix(9))
+        for selection in picked {
+            StubURLProtocol.stubs[service.scoreURL(for: selection).absoluteString] =
+                .init(data: Data("slow down".utf8), statusCode: 429, headers: ["Retry-After": "120"])
+        }
+
+        let outcome = await service.fetchBatch(binding: binding, selections: picked) { _, _ in }
+
+        XCTAssertEqual(outcome.retryAfter, 120)
+        XCTAssertNotNil(outcome.stopReason)
+        XCTAssertGreaterThan(outcome.skipped, 0, "暂停后剩余档位不再发请求")
+        XCTAssertLessThan(scoreRequestCount(), picked.count)
+        XCTAssertTrue(sleeps.values.isEmpty, "超过上限的 Retry-After 不在本轮里睡等")
+    }
+
+    func testFetchBatch_428StopsBatch() async throws {
+        let service = makeService()
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+        let picked = Array(BenchFixtures.selections.prefix(9))
+        for selection in picked {
+            StubURLProtocol.stubs[service.scoreURL(for: selection).absoluteString] =
+                .init(data: Data("{}".utf8), statusCode: 428)
+        }
+
+        let outcome = await service.fetchBatch(binding: binding, selections: picked) { _, _ in }
+
+        XCTAssertNotNil(outcome.stopReason)
+        XCTAssertLessThan(scoreRequestCount(), picked.count)
+        XCTAssertTrue(sleeps.values.isEmpty, "428 是确定性拒绝，不重试")
+    }
+
+    // MARK: - 批量读取：并发叫停 / 冷却延长 / 取消（可控闸门，不依赖真实等待）
+
+    /// s0 先繁忙（Retry-After 10，重试在冷却里等）；s1 成功后其 worker 领取 s3 并卡在共享冷却里；
+    /// s2 最后返回 `stopStub` 叫停整批。叫停通知（s2 的回调）才放行所有等待。
+    /// 叫停后：s0 的重试、s3（已领取未发送）、s4（未领取）都不能再发请求。
+    private func runConcurrentStopScenario(stopStub: StubURLProtocol.Stub) async throws -> (RadarBenchBatchOutcome, [BenchSelection], BatchResultLog) {
+        let sleeper = ManualSleeper(clock: serviceClock)
+        let service = makeGatedService(sleeper)
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+        let picked = Array(BenchFixtures.selections.prefix(5))
+        func url(_ i: Int) -> String { service.scoreURL(for: picked[i]).absoluteString }
+        StubURLProtocol.sequences[url(0)] = [
+            .init(data: Data("busy".utf8), statusCode: 503, headers: ["Retry-After": "10"]),
+            .init(data: BenchFixtures.summaryData(picked[0]), statusCode: 200),
+        ]
+        StubURLProtocol.stubs[url(1)] = .init(data: BenchFixtures.summaryData(picked[1]), statusCode: 200, delay: 0.15)
+        var stop = stopStub
+        stop.delay = 0.5
+        StubURLProtocol.stubs[url(2)] = stop
+        for i in 3...4 {
+            StubURLProtocol.stubs[url(i)] = .init(data: BenchFixtures.summaryData(picked[i]), statusCode: 200)
+        }
+
+        let log = BatchResultLog()
+        let stopper = picked[2].id
+        let outcome = await service.fetchBatch(binding: binding, selections: picked) { selection, result in
+            if case .success = result { log.record(selection.id, success: true) } else { log.record(selection.id, success: false) }
+            // 叫停已经生效（回调在 state.stop 之后），此时才放行所有挂起的等待。
+            if selection.id == stopper { sleeper.openAll() }
+        }
+        sleeper.openAll()
+        return (outcome, picked, log)
+    }
+
+    private func assertConcurrentStopClosesBatch(
+        _ outcome: RadarBenchBatchOutcome, _ picked: [BenchSelection], _ log: BatchResultLog,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let service = RadarService()
+        func count(_ i: Int) -> Int { requestCount(service.scoreURL(for: picked[i])) }
+        XCTAssertEqual([count(0), count(1), count(2), count(3), count(4)], [1, 1, 1, 0, 0],
+                       "叫停后：s0 的重试、已领取的 s3、未领取的 s4 都不能再发请求", file: file, line: line)
+        XCTAssertNotNil(outcome.stopReason, file: file, line: line)
+        XCTAssertEqual(outcome.succeeded, 1, "只有 s1 成功", file: file, line: line)
+        XCTAssertEqual(outcome.failed, 2, "s0（已尝试、重试被叫停）与 s2（叫停者）计为失败", file: file, line: line)
+        XCTAssertEqual(outcome.skipped, 2, "s3 已领取未发送 + s4 未领取 = skipped", file: file, line: line)
+        XCTAssertEqual(outcome.cancelled, 0, file: file, line: line)
+        XCTAssertEqual(outcome.succeeded + outcome.failed + outcome.skipped + outcome.cancelled, picked.count,
+                       "统计必须闭合", file: file, line: line)
+        // 回调只给「尝试过」的档位：s0 失败、s1 成功、s2 失败；skipped 的 s3 / s4 没有回调。
+        let entries = log.entries
+        XCTAssertEqual(Set(entries.map(\.id)), [picked[0].id, picked[1].id, picked[2].id], file: file, line: line)
+        XCTAssertEqual(entries.first { $0.id == picked[1].id }?.success, true, file: file, line: line)
+        XCTAssertEqual(entries.first { $0.id == picked[0].id }?.success, false, file: file, line: line)
+    }
+
+    func testFetchBatch_concurrentLongRetryAfterStop_claimedAndRetryingTasksNeverSend() async throws {
+        let (outcome, picked, log) = try await runConcurrentStopScenario(
+            stopStub: .init(data: Data("slow down".utf8), statusCode: 429, headers: ["Retry-After": "120"]))
+        assertConcurrentStopClosesBatch(outcome, picked, log)
+        XCTAssertEqual(outcome.retryAfter, 120)
+    }
+
+    func testFetchBatch_concurrent428Stop_claimedAndRetryingTasksNeverSend() async throws {
+        let (outcome, picked, log) = try await runConcurrentStopScenario(
+            stopStub: .init(data: Data("{}".utf8), statusCode: 428))
+        assertConcurrentStopClosesBatch(outcome, picked, log)
+        XCTAssertNil(outcome.retryAfter)
+    }
+
+    func testFetchBatch_cooldownExtendedWhileWaiting_wakingWorkerHonorsLatestDeadline() async throws {
+        let sleeper = ManualSleeper(clock: serviceClock)
+        let service = makeGatedService(sleeper)
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+        let picked = Array(BenchFixtures.selections.prefix(2))
+        // s0：Retry-After 5 后重试成功。s1：稍后返回更长的 Retry-After 20，把共享冷却延长到 t0+20。
+        StubURLProtocol.sequences[service.scoreURL(for: picked[0]).absoluteString] = [
+            .init(data: Data("busy".utf8), statusCode: 503, headers: ["Retry-After": "5"]),
+            .init(data: BenchFixtures.summaryData(picked[0]), statusCode: 200),
+        ]
+        StubURLProtocol.sequences[service.scoreURL(for: picked[1]).absoluteString] = [
+            .init(data: Data("busy".utf8), statusCode: 503, headers: ["Retry-After": "20"], delay: 0.3),
+            .init(data: BenchFixtures.summaryData(picked[1]), statusCode: 200),
+        ]
+        let task = Task { await service.fetchBatch(binding: binding, selections: picked) { _, _ in } }
+        defer { sleeper.openAll() }
+
+        let bothWaiting = await waitUntil { sleeper.waitingCount == 2 }
+        XCTAssertTrue(bothWaiting, "两个 worker 都应在共享冷却里等")
+        XCTAssertEqual(sleeper.values, [5, 20])
+        XCTAssertEqual(scoreRequestCount(), 2)
+
+        // 放行 s0 的 5 秒等待：冷却已被 s1 延长到 20 秒，醒来后只能再等剩下的 15 秒，不能直接重试。
+        sleeper.releaseNext()
+        let reWaiting = await waitUntil { sleeper.values.count == 3 && sleeper.waitingCount == 2 }
+        XCTAssertTrue(reWaiting, "醒后应按最新截止时间继续等")
+        XCTAssertEqual(sleeper.values, [5, 20, 15])
+        XCTAssertEqual(requestCount(service.scoreURL(for: picked[0])), 1, "冷却未结束，s0 不能重试")
+        XCTAssertEqual(scoreRequestCount(), 2)
+
+        sleeper.openAll()
+        let outcome = await task.value
+        XCTAssertEqual(outcome.succeeded, 2)
+        XCTAssertEqual(scoreRequestCount(), 4)
+    }
+
+    func testFetchBatch_cancelWhileWaitingOnCooldown_sendsNothingMoreAndClosesStats() async throws {
+        let sleeper = ManualSleeper(clock: serviceClock)
+        let service = makeGatedService(sleeper)
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+        let picked = Array(BenchFixtures.selections.prefix(5))
+        // s0 繁忙 → 共享冷却；s1、s2 稍后成功，其 worker 领取 s3、s4 后卡在冷却里。
+        StubURLProtocol.sequences[service.scoreURL(for: picked[0]).absoluteString] = [
+            .init(data: Data("busy".utf8), statusCode: 503, headers: ["Retry-After": "5"]),
+            .init(data: BenchFixtures.summaryData(picked[0]), statusCode: 200),
+        ]
+        for i in 1...4 {
+            StubURLProtocol.stubs[service.scoreURL(for: picked[i]).absoluteString] =
+                .init(data: BenchFixtures.summaryData(picked[i]), statusCode: 200, delay: i <= 2 ? 0.2 : 0)
+        }
+        let task = Task { await service.fetchBatch(binding: binding, selections: picked) { _, _ in } }
+        defer { sleeper.openAll() }
+
+        let allWaiting = await waitUntil { sleeper.waitingCount == 3 }
+        XCTAssertTrue(allWaiting, "s0 的重试 + 已领取的 s3、s4 都应卡在冷却里")
+        XCTAssertEqual(scoreRequestCount(), 3)
+
+        task.cancel()
+        let outcome = await task.value
+
+        XCTAssertEqual(scoreRequestCount(), 3, "取消后不再发任何请求")
+        XCTAssertEqual(outcome.succeeded, 2)
+        XCTAssertEqual(outcome.failed, 0)
+        XCTAssertEqual(outcome.skipped, 0, "取消不是整批暂停")
+        XCTAssertEqual(outcome.cancelled, 3, "s0（重试中）、s3、s4 被取消")
+        XCTAssertNil(outcome.stopReason)
+    }
+
+    func testFetchBatch_identityMismatchIsFailureAndNotRetried() async throws {
+        let service = makeService()
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+        let selection = BenchFixtures.selections[0]
+        let url = service.scoreURL(for: selection).absoluteString
+        StubURLProtocol.stubs[url] = .init(
+            data: BenchFixtures.summaryData(selection, sha: String(repeating: "0", count: 64)), statusCode: 200)
+
+        let outcome = await service.fetchBatch(binding: binding, selections: [selection]) { _, _ in }
+
+        XCTAssertEqual(outcome.failed, 1)
+        XCTAssertEqual(StubURLProtocol.requestedURLs.filter { $0 == url }.count, 1)
+    }
+
+    func testRetryAfterParsing_secondsAndHTTPDate() {
+        let url = URL(string: "https://codexradar.com/")!
+        func response(_ value: String) -> HTTPURLResponse {
+            HTTPURLResponse(url: url, statusCode: 503, httpVersion: nil, headerFields: ["Retry-After": value])!
+        }
+        XCTAssertEqual(RadarService.retryAfter(in: response("7")), 7)
+        XCTAssertEqual(RadarService.retryAfter(in: response("1.5")), 1.5)
+        XCTAssertNil(RadarService.retryAfter(in: response("-5")))
+        XCTAssertNil(RadarService.retryAfter(in: response("soon")))
+        let now = ISO8601DateFormatter().date(from: "2026-10-18T12:00:00Z")!
+        XCTAssertEqual(RadarService.retryAfter(in: response("Sun, 18 Oct 2026 12:00:30 GMT"), now: now) ?? -1, 30, accuracy: 0.5)
+    }
+
+    func testFetchBinding_retriesBusyThenValidates() async throws {
+        let service = makeService()
+        StubURLProtocol.sequences[service.bindingURL.absoluteString] = [
+            .init(data: Data(), statusCode: 503, headers: ["Retry-After": "3"]),
+            .init(data: BenchFixtures.bindingData(), statusCode: 200),
+        ]
+        let binding = try await service.fetchBinding()
+        XCTAssertEqual(binding.selections.count, 34)
+        XCTAssertEqual(sleeps.values, [3])
+    }
+
+    // MARK: - 缓存存取
+
+    func testStore_roundTripsObservationsAndDropsExpiredOnes() throws {
+        let store = RadarBenchStore(defaults: isolatedDefaults())
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+        let fresh = BenchFixtures.selections[0], old = BenchFixtures.selections[1]
+        let t0 = BenchFixtures.t0
+        func entry(_ s: BenchSelection, at: Date) throws -> RadarBenchEntry {
+            RadarBenchEntry(observation: try RadarBenchParser.parseObservation(
+                json: BenchFixtures.summaryData(s), binding: binding, selection: s), fetchedAt: at)
+        }
+        store.save(binding: binding, entries: [
+            fresh.id: try entry(fresh, at: t0.addingTimeInterval(-3600)),
+            old.id: try entry(old, at: t0.addingTimeInterval(-25 * 3600)),
+        ])
+
+        let loaded = try XCTUnwrap(store.load(now: t0))
+        XCTAssertEqual(loaded.binding, binding)
+        XCTAssertEqual(Set(loaded.entries.keys), [fresh.id], "超过 24h 的观测载入时必须丢弃")
+        XCTAssertEqual(loaded.entries[fresh.id]?.fetchedAt, t0.addingTimeInterval(-3600))
+        XCTAssertNotNil(loaded.entries[fresh.id]?.observation?.raw["history"], "原始响应（含未建模字段）随缓存保留")
+    }
+
+    // MARK: - ViewModel：成功路径、读取时间 vs 评分时间、榜首
+
+    @MainActor
+    func testRefresh_success_separatesReadTimeFromGradedTime_andNamesChampionOnlyWhenComplete() async throws {
+        let service = makeService()
+        stubHappyPath(service)
+        let clock = TestClock(BenchFixtures.t0)
+        let vm = makeVM(service, clock: clock)
+
         await vm.refresh()
 
-        XCTAssertEqual(vm.snapshot?.codexSource, .website)
-        let goodIDs = vm.snapshot?.codexGroup.map(\.id)
-        XCTAssertEqual(goodIDs, ["gpt-5.4/xhigh", "gpt-5.5/medium"])
+        let snapshot = try XCTUnwrap(vm.snapshot)
+        XCTAssertEqual(snapshot.codexGroup.count, 34)
+        XCTAssertEqual(snapshot.updatedAt, BenchFixtures.t0, "updatedAt 是成功读取时间")
+        let graded = try XCTUnwrap(snapshot.benchmark?.latestGradedAt)
+        let expectedGraded = ISO8601DateFormatter().date(from: "2026-10-18T00:59:23Z")!.timeIntervalSince1970 + 0.459
+        XCTAssertEqual(graded.timeIntervalSince1970, expectedGraded, accuracy: 0.01)
+        XCTAssertNotEqual(graded, snapshot.updatedAt, "评分时间来自接口，绝不等于读取时间或 Date()")
+        XCTAssertNotNil(snapshot.gradedAtLabel)
+        XCTAssertEqual(snapshot.menuBarBest?.id, "gpt-6.1-sol/low", "整批完整时才有榜首（分数最高者）")
         XCTAssertNil(vm.lastError)
-
-        // efficiency 掉线，current.json 本来就是失败态 → service 只能给出 .recommendationsOnly
-        StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = nil
-        StubURLProtocol.errors[service.efficiencyURL.absoluteString] = URLError(.timedOut)
-        await vm.refresh()
-
-        XCTAssertEqual(vm.snapshot?.codexSource, .website, "不得用只剩推荐条目的快照覆盖完整榜单")
-        XCTAssertEqual(vm.snapshot?.codexGroup.map(\.id), goodIDs)
-        XCTAssertEqual(vm.lastError, RadarViewModel.staleNotice)
-        XCTAssertFalse(vm.isLoading)
-    }
-
-    // MARK: - 榜单模式 / 展开状态在刷新前后保留（refresh() 只替换 snapshot，不 touch 这两个字段）
-
-    @MainActor
-    func testViewModelRefresh_doesNotResetListModeOrExpandedState_onFailure() async {
-        let originalListMode = UserDefaults.standard.object(forKey: RadarViewModel.listModeKey)
-        defer {
-            if let originalListMode {
-                UserDefaults.standard.set(originalListMode, forKey: RadarViewModel.listModeKey)
-            } else {
-                UserDefaults.standard.removeObject(forKey: RadarViewModel.listModeKey)
-            }
-        }
-        let service = RadarService()
-        failAll(service)   // 四源全失败 → fetch() 必然 throws，走 catch 分支
-
-        let vm = RadarViewModel()
-        vm.listMode = .full
-        vm.expandedRecommendationIDs = ["gpt-5.5#codexRadar"]
-
-        await vm.refresh()
-
-        XCTAssertNotNil(vm.lastError, "四源全失败应走错误分支")
-        XCTAssertEqual(vm.listMode, .full, "刷新失败不应重置榜单模式")
-        XCTAssertEqual(vm.expandedRecommendationIDs, ["gpt-5.5#codexRadar"], "刷新失败不应重置展开状态")
+        XCTAssertEqual(scoreRequestCount(), 34)
+        // 每个评分请求都带选择头（桩对缺头返回 428，全部成功即说明都带了）。
+        XCTAssertTrue(StubURLProtocol.requestLog.filter { $0.url.contains("/api/radar-bench-score") }
+            .allSatisfy { $0.headers[RadarService.selectionHeaderField] == "user-selected-v1" })
     }
 
     @MainActor
-    func testViewModelRefresh_doesNotResetListModeOrExpandedState_onSuccess() async {
-        let originalListMode = UserDefaults.standard.object(forKey: RadarViewModel.listModeKey)
-        defer {
-            if let originalListMode {
-                UserDefaults.standard.set(originalListMode, forKey: RadarViewModel.listModeKey)
-            } else {
-                UserDefaults.standard.removeObject(forKey: RadarViewModel.listModeKey)
-            }
+    func testRefresh_partialFirstBatch_neverDeclaresChampion() async throws {
+        let service = makeService()
+        stubHappyPath(service)
+        // 只有前 5 档成功，其余 500。
+        for selection in BenchFixtures.selections.dropFirst(5) {
+            StubURLProtocol.stubs[service.scoreURL(for: selection).absoluteString] = .init(data: Data("err".utf8), statusCode: 500)
         }
-        let service = RadarService()
-        failAll(service)
-        StubURLProtocol.errors[service.insightsURL.absoluteString] = nil
-        StubURLProtocol.errors[service.efficiencyURL.absoluteString] = nil
-        StubURLProtocol.stubs[service.insightsURL.absoluteString] = .init(data: Data(insightsJSON.utf8), statusCode: 200)
-        StubURLProtocol.stubs[service.efficiencyURL.absoluteString] = .init(data: Data(efficiencyJSON.utf8), statusCode: 200)
-
-        let vm = RadarViewModel()
-        vm.listMode = .full
-        vm.expandedRecommendationIDs = ["gpt-5.4#codexRadar"]
+        let vm = makeVM(service, clock: TestClock(BenchFixtures.t0))
 
         await vm.refresh()
 
+        let snapshot = try XCTUnwrap(vm.snapshot)
+        XCTAssertEqual(snapshot.codexGroup.count, 5)
+        XCTAssertNil(snapshot.menuBarBest, "局部批次的最高分不是全局冠军")
+        XCTAssertEqual(StatusItemTitleBuilder.make(snapshot: snapshot).string, "◐ 6.1-sol·low 5/34")
+        XCTAssertEqual(snapshot.provisionalMenuBarBest?.id, "gpt-6.1-sol/low")
+        XCTAssertEqual(snapshot.menuBarDisplayedID, snapshot.provisionalMenuBarBest?.id)
+        let detail = try XCTUnwrap(StatusItemTitleBuilder.detail(snapshot: snapshot, now: BenchFixtures.t0))
+        XCTAssertTrue(detail.contains("不是全榜冠军"))
+        XCTAssertTrue(detail.contains("5/34"))
+        XCTAssertTrue(detail.contains("29 个档位最近一次刷新失败"))
+        XCTAssertFalse(detail.contains("全榜榜首"))
+        XCTAssertNotNil(vm.lastError)
+    }
+
+    // MARK: - ViewModel：部分失败不覆盖成功行
+
+    @MainActor
+    func testRefresh_partialFailure_keepsPreviousSuccessfulRows() async throws {
+        let service = makeService()
+        stubHappyPath(service)
+        let clock = TestClock(BenchFixtures.t0)
+        let vm = makeVM(service, clock: clock)
+        await vm.refresh()
+        let before = try XCTUnwrap(vm.snapshot)
+        let failing = Array(BenchFixtures.selections[0..<3])
+
+        clock.advance(600)
+        for selection in failing {
+            StubURLProtocol.stubs[service.scoreURL(for: selection).absoluteString] = .init(data: Data("err".utf8), statusCode: 500)
+        }
+        // 其余档位给新分数，证明成功行确实被更新。
+        let updated = BenchFixtures.selections[10]
+        StubURLProtocol.stubs[service.scoreURL(for: updated).absoluteString] =
+            .init(data: BenchFixtures.summaryData(updated, score: 33.5), statusCode: 200)
+        await vm.refresh()
+
+        let after = try XCTUnwrap(vm.snapshot)
+        XCTAssertEqual(after.codexGroup.count, 34, "失败的读取不能让成功行消失")
+        for selection in failing {
+            let row = try XCTUnwrap(after.codexGroup.first { $0.id == selection.id })
+            let old = try XCTUnwrap(before.codexGroup.first { $0.id == selection.id })
+            XCTAssertEqual(row.result.bench?.score, old.result.bench?.score, "失败档位保留上次成功的分数")
+            XCTAssertEqual(row.benchRead?.fetchedAt, BenchFixtures.t0, "读取时间仍是上次成功读取，而不是这次尝试")
+            XCTAssertEqual(row.benchRead?.isStale, true)
+            XCTAssertNotNil(row.benchRead?.lastError)
+        }
+        XCTAssertEqual(after.codexGroup.first { $0.id == updated.id }?.result.bench?.score, 33.5)
+        XCTAssertNil(after.menuBarBest, "本轮有档位读取失败，不再声明榜首")
+        XCTAssertTrue(vm.lastError?.contains("3 个档位读取失败") ?? false)
+    }
+
+    // MARK: - ViewModel：基准变化作废缓存与旧观测
+
+    @MainActor
+    func testRefresh_bindingChange_discardsOldBenchmarkObservationsAndCache() async throws {
+        let defaults = isolatedDefaults()
+        let service = makeService()
+        stubHappyPath(service)
+        let clock = TestClock(BenchFixtures.t0)
+        let first = makeVM(service, clock: clock, defaults: defaults)
+        await first.refresh()
+        XCTAssertEqual(first.snapshot?.codexGroup.count, 34)
+        StubURLProtocol.reset()
+
+        // 站点换了任务集（新 sha / 新基准名）：只有一档能读到，其余失败。
+        let newSHA = String(repeating: "b", count: 64)
+        StubURLProtocol.stubs[service.bindingURL.absoluteString] =
+            .init(data: BenchFixtures.bindingData(benchmark: "radar-bench-next", sha: newSHA), statusCode: 200)
+        for selection in BenchFixtures.selections {
+            StubURLProtocol.stubs[service.scoreURL(for: selection).absoluteString] = .init(data: Data("err".utf8), statusCode: 500)
+        }
+        let readable = BenchFixtures.selections[4]
+        StubURLProtocol.stubs[service.scoreURL(for: readable).absoluteString] = .init(
+            data: BenchFixtures.summaryData(readable, score: 50, sha: newSHA, benchmark: "radar-bench-next"), statusCode: 200)
+
+        let second = makeVM(service, clock: clock, defaults: defaults)
+        XCTAssertEqual(second.snapshot?.codexGroup.count, 34, "启动时先用同基准的 24h 内缓存")
+        await second.refresh()
+
+        let snapshot = try XCTUnwrap(second.snapshot)
+        XCTAssertEqual(snapshot.codexGroup.map(\.id), [readable.id], "新基准下旧观测一条都不能混入")
+        XCTAssertEqual(snapshot.benchmark?.binding.benchmark, "radar-bench-next")
+        // 重启后缓存里也不应再有旧基准的数据。
+        let reloaded = RadarBenchStore(defaults: defaults).load(now: clock.now)
+        XCTAssertEqual(reloaded?.binding.taskSetSHA256, newSHA)
+        XCTAssertEqual(reloaded?.entries.count, 1)
+    }
+
+    @MainActor
+    func testCache_olderThan24h_isNotShown_andWithin24h_isMarkedStale() async throws {
+        let defaults = isolatedDefaults()
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+        let store = RadarBenchStore(defaults: defaults)
+        let a = BenchFixtures.selections[0], b = BenchFixtures.selections[1]
+        func entry(_ s: BenchSelection, ageHours: Double) throws -> RadarBenchEntry {
+            RadarBenchEntry(
+                observation: try RadarBenchParser.parseObservation(
+                    json: BenchFixtures.summaryData(s), binding: binding, selection: s),
+                fetchedAt: BenchFixtures.t0.addingTimeInterval(-ageHours * 3600))
+        }
+        store.save(binding: binding, entries: [a.id: try entry(a, ageHours: 25), b.id: try entry(b, ageHours: 23)])
+
+        let vm = RadarViewModel(service: makeService(), cacheDefaults: defaults, now: { BenchFixtures.t0 })
+
+        XCTAssertEqual(vm.snapshot?.codexGroup.map(\.id), [b.id])
+        XCTAssertEqual(vm.snapshot?.codexGroup.first?.benchRead?.isStale, true)
+    }
+
+    // MARK: - ViewModel：后台轮询不整批重扫
+
+    @MainActor
+    func testRefresh_backgroundOnlyRereadsMissingOrStaleSelections() async throws {
+        let service = makeService()
+        stubHappyPath(service)
+        let clock = TestClock(BenchFixtures.t0)
+        let vm = makeVM(service, clock: clock)
+
+        await vm.refresh(trigger: .launch)
+        XCTAssertEqual(scoreRequestCount(), 34)
+
+        clock.advance(30 * 60)
+        await vm.refresh(trigger: .background)
+        XCTAssertEqual(scoreRequestCount(), 34, "30 分钟后的后台轮询不应再发 34 个评分请求")
+
+        clock.advance(4 * 3600)
+        await vm.refresh(trigger: .background)
+        XCTAssertEqual(scoreRequestCount(), 68, "超过 staleAfter 才重读")
+
+        clock.advance(120)
+        await vm.refresh(trigger: .manual)
+        XCTAssertEqual(scoreRequestCount(), 102, "手动刷新重读全部档位")
+
+        clock.advance(10)
+        await vm.refresh(trigger: .manual)
+        XCTAssertEqual(scoreRequestCount(), 102, "手动刷新也不会在 60s 内重复读同一档位")
+    }
+
+    @MainActor
+    func testRefresh_afterBusyPauseHonorsRetryAfterCooldown() async throws {
+        let service = makeService()
+        stubHappyPath(service)
+        for selection in BenchFixtures.selections {
+            StubURLProtocol.stubs[service.scoreURL(for: selection).absoluteString] =
+                .init(data: Data("slow".utf8), statusCode: 429, headers: ["Retry-After": "120"])
+        }
+        let clock = TestClock(BenchFixtures.t0)
+        let vm = makeVM(service, clock: clock)
+        await vm.refresh()
+        let requestsAfterFirst = StubURLProtocol.requestedURLs.count
+
+        clock.advance(30)
+        await vm.refresh(trigger: .manual)
+
+        XCTAssertEqual(StubURLProtocol.requestedURLs.count, requestsAfterFirst, "冷却期内不发任何请求")
+        XCTAssertTrue(vm.lastError?.contains("站点繁忙") ?? false)
+    }
+
+    @MainActor
+    func testRefresh_bindingRejected_doesNotReadScores() async throws {
+        let service = makeService()
+        stubHappyPath(service, binding: BenchFixtures.bindingData(verified: false))
+        let vm = makeVM(service, clock: TestClock(BenchFixtures.t0))
+
+        await vm.refresh()
+
+        XCTAssertNil(vm.snapshot)
+        XCTAssertNotNil(vm.lastError)
+        XCTAssertEqual(scoreRequestCount(), 0, "绑定未通过校验就不读成绩")
+    }
+
+    // MARK: - 偏好与榜单状态在刷新前后保留
+
+    @MainActor
+    func testRefresh_preservesPersistedPreferencesAndExpandedState_onSuccessAndFailure() async {
+        let originalListMode = UserDefaults.standard.object(forKey: RadarViewModel.listModeKey)
+        let originalFrontier = UserDefaults.standard.object(forKey: RadarViewModel.onlyFrontierKey)
+        defer {
+            for (key, value) in [(RadarViewModel.listModeKey, originalListMode), (RadarViewModel.onlyFrontierKey, originalFrontier)] {
+                if let value { UserDefaults.standard.set(value, forKey: key) } else { UserDefaults.standard.removeObject(forKey: key) }
+            }
+        }
+        let service = makeService()
+        stubHappyPath(service)
+        let clock = TestClock(BenchFixtures.t0)
+        let vm = makeVM(service, clock: clock)
+        vm.listMode = .full
+        vm.onlyFrontier = true
+        vm.expandedRecommendationIDs = ["gpt-6.1-sol#codexRadar"]
+
+        await vm.refresh()
         XCTAssertNotNil(vm.snapshot)
-        XCTAssertEqual(vm.listMode, .full, "刷新成功也不应重置榜单模式")
-        XCTAssertEqual(vm.expandedRecommendationIDs, ["gpt-5.4#codexRadar"], "刷新成功也不应重置展开状态")
+        XCTAssertEqual(vm.listMode, .full)
+        XCTAssertTrue(vm.onlyFrontier)
+        XCTAssertEqual(vm.expandedRecommendationIDs, ["gpt-6.1-sol#codexRadar"])
+
+        StubURLProtocol.reset()   // 全部不可用：失败路径
+        StubURLProtocol.errors[service.bindingURL.absoluteString] = URLError(.timedOut)
+        clock.advance(600)
+        await vm.refresh()
+        XCTAssertNotNil(vm.lastError)
+        XCTAssertNotNil(vm.snapshot, "整体读取失败也保留上次成功的榜单")
+        XCTAssertEqual(vm.listMode, .full)
+        XCTAssertTrue(vm.onlyFrontier)
+        XCTAssertEqual(vm.expandedRecommendationIDs, ["gpt-6.1-sol#codexRadar"])
+
+        // 新实例从 UserDefaults 读回同样的偏好（跨会话保存）。
+        let reopened = makeVM(service, clock: clock)
+        XCTAssertEqual(reopened.listMode, .full)
+        XCTAssertTrue(reopened.onlyFrontier)
     }
 
+    // MARK: - 快照形态：不虚构竞品分区，Terra/Luna 不被旧单档收敛折叠
+
+    @MainActor
+    func testRefresh_snapshotShowsOnlyOpenAISection_andKeepsAllLunaTiers() async throws {
+        let service = makeService()
+        stubHappyPath(service)
+        let vm = makeVM(service, clock: TestClock(BenchFixtures.t0))
+        await vm.refresh()
+
+        let snapshot = try XCTUnwrap(vm.snapshot)
+        XCTAssertEqual(snapshot.availableSections, [.vendor(.openai)], "绑定里没有 Claude/Grok/DeepSeek，不凭空出现")
+        XCTAssertTrue(snapshot.claudeGroup.isEmpty)
+        let luna = snapshot.codexGroupsByVendor.first?.models.filter { $0.result.name == "gpt-5.6-luna" }
+        XCTAssertEqual(luna?.count, 5, "旧的 luna 单档收敛与 IQ≥50 下限不适用于 Radar Bench")
+    }
+
+    // MARK: - 固定控件可达
+
+    func testBoardMaxHeight_keepsFixedControlsOnScreen() {
+        let screen: CGFloat = 800, chrome: CGFloat = 330
+        let board = PopoverRootView.boardMaxHeight(screenHeight: screen, chromeHeight: chrome)
+        XCTAssertLessThanOrEqual(board + chrome + 12, screen, "滚动区 + 固定区域不能超出屏幕，底部刷新/退出才点得到")
+        // 头部提示变长（固定区域变高）时，滚动区相应缩小。
+        XCTAssertLessThan(PopoverRootView.boardMaxHeight(screenHeight: screen, chromeHeight: 420), board)
+        // 首帧还没量到固定区域高度时用保守估算。
+        XCTAssertEqual(PopoverRootView.boardMaxHeight(screenHeight: screen, chromeHeight: 0), 800 - 260 - 40)
+        XCTAssertGreaterThanOrEqual(PopoverRootView.boardMaxHeight(screenHeight: 300, chromeHeight: 330), 120)
+    }
 }

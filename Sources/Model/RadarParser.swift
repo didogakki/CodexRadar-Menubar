@@ -392,11 +392,13 @@ enum RadarParser {
                 cost: old.cost, timeMinutes: old.timeMinutes,
                 family: .claude,
                 isReference: old.isReference,
-                metricSource: .codexRadar
+                metricSource: .codexRadar,
+                bench: old.bench
             )
             let supplement = ScoredModel(
                 result: renamed, score: model.score,
-                recommendedIn: model.recommendedIn, costIndex: model.costIndex
+                recommendedIn: model.recommendedIn, costIndex: model.costIndex,
+                benchRead: model.benchRead
             )
             guard !existingIDs.contains(supplement.id) else { return nil }
             return supplement
@@ -410,7 +412,8 @@ enum RadarParser {
                 result: model.result,
                 score: maxIq > 0 ? model.result.iq / maxIq : 0,
                 recommendedIn: model.recommendedIn,
-                costIndex: model.costIndex
+                costIndex: model.costIndex,
+                benchRead: model.benchRead
             )
         })
     }
@@ -517,5 +520,263 @@ enum RadarParser {
         let mins = max(0, Int((now.timeIntervalSince(updatedAt) / 60).rounded(.down)))
         let h = mins / 60, m = mins % 60
         return h > 0 ? "\(h) 小时 \(m) 分钟" : "\(m) 分钟"
+    }
+}
+
+// MARK: - Radar Bench（radar-bench-binding.json / radar-bench-score?view=summary）
+
+enum RadarBenchError: LocalizedError {
+    case invalidBinding(String)
+    case invalidObservation(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidBinding(let reason): return "基准绑定无效：\(reason)"
+        case .invalidObservation(let reason): return "成绩响应无效：\(reason)"
+        }
+    }
+}
+
+/// 解码并校验 Radar Bench 绑定与逐档成绩，再把读取状态组装成快照。
+/// 所有校验都是「宁可拒绝也不误读」：身份（benchmark / catalog / task_set_sha256 / 计分版本 / 模型 / 档位）
+/// 必须与绑定逐项一致，分数必须落在 0...score_max，覆盖与状态必须自洽。
+enum RadarBenchParser {
+
+    // MARK: 绑定
+
+    static func parseBinding(json data: Data) throws -> RadarBenchBinding {
+        guard let root = try? JSONDecoder().decode(JSONValue.self, from: data), root.objectValue != nil else {
+            throw RadarBenchError.invalidBinding("不是 JSON 对象")
+        }
+        guard root["enabled"]?.boolValue == true, root["production_read_verified"]?.boolValue == true else {
+            throw RadarBenchError.invalidBinding("未启用或未通过生产读取验证")
+        }
+        func text(_ key: String) throws -> String {
+            guard let value = root[key]?.stringValue, !value.trimmingCharacters(in: .whitespaces).isEmpty else {
+                throw RadarBenchError.invalidBinding("缺少 \(key)")
+            }
+            return value
+        }
+        let benchmark = try text("benchmark")
+        let catalog = try text("catalog_version")
+        let sha = try text("task_set_sha256")
+        let scoreVersion = try text("score_version")
+        guard isSHA256(sha) else { throw RadarBenchError.invalidBinding("task_set_sha256 不是 64 位十六进制") }
+        guard let scoreMax = root["score_max"]?.doubleValue, scoreMax > 0 else {
+            throw RadarBenchError.invalidBinding("score_max 无效")
+        }
+        guard let totalTasks = root["total_tasks"]?.intValue, totalTasks > 0 else {
+            throw RadarBenchError.invalidBinding("total_tasks 无效")
+        }
+        if let counts = root["source_counts"]?.objectValue {
+            let values = counts.values.compactMap(\.intValue)
+            guard values.count == counts.count, values.reduce(0, +) == totalTasks else {
+                throw RadarBenchError.invalidBinding("source_counts 与 total_tasks 不一致")
+            }
+        }
+        guard let items = root["model_efforts"]?.arrayValue else {
+            throw RadarBenchError.invalidBinding("缺少 model_efforts")
+        }
+        var seen = Set<String>()
+        var selections: [BenchSelection] = []
+        for item in items {
+            guard let model = item["model"]?.stringValue, !model.isEmpty,
+                  let effort = item["effort"]?.stringValue, !effort.isEmpty else { continue }
+            let selection = BenchSelection(model: model, effort: effort)
+            if seen.insert(selection.id).inserted { selections.append(selection) }
+        }
+        guard !selections.isEmpty else { throw RadarBenchError.invalidBinding("没有可读取的模型档位") }
+        guard selections.count <= RadarBenchPolicy.maxSelections else {
+            throw RadarBenchError.invalidBinding("模型档位数量异常（\(selections.count)）")
+        }
+        return RadarBenchBinding(
+            benchmark: benchmark, catalogVersion: catalog, taskSetSHA256: sha,
+            scoreVersion: scoreVersion, scoreMax: scoreMax, totalTasks: totalTasks, selections: selections
+        )
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.count == 64 && value.allSatisfy(\.isHexDigit)
+    }
+
+    // MARK: 逐档成绩
+
+    static func parseObservation(
+        json data: Data, binding: RadarBenchBinding, selection: BenchSelection
+    ) throws -> RadarBenchObservation {
+        guard let root = try? JSONDecoder().decode(JSONValue.self, from: data) else {
+            throw RadarBenchError.invalidObservation("不是合法 JSON")
+        }
+        return try parseObservation(root, binding: binding, selection: selection)
+    }
+
+    static func parseObservation(
+        _ root: JSONValue, binding: RadarBenchBinding, selection: BenchSelection
+    ) throws -> RadarBenchObservation {
+        func fail(_ reason: String) -> RadarBenchError { .invalidObservation(reason) }
+        guard root.objectValue != nil else { throw fail("不是 JSON 对象") }
+
+        func text(_ key: String) throws -> String {
+            guard let value = root[key]?.stringValue, !value.isEmpty else { throw fail("缺少 \(key)") }
+            return value
+        }
+        let schema = try text("schema")
+        guard schema.hasPrefix("radar-bench-public-summary-") else { throw fail("schema 不受支持：\(schema)") }
+
+        // 身份：必须与绑定及所请求的档位逐项一致，防止错位 / 旧基准 / 别的档位的响应混进来。
+        let benchmark = try text("benchmark")
+        let catalog = try text("catalog_version")
+        let sha = try text("task_set_sha256")
+        let scoreVersion = try text("score_version")
+        guard benchmark == binding.benchmark else { throw fail("benchmark 与绑定不一致") }
+        guard catalog == binding.catalogVersion else { throw fail("catalog_version 与绑定不一致") }
+        guard sha == binding.taskSetSHA256 else { throw fail("task_set_sha256 与绑定不一致") }
+        guard scoreVersion == binding.scoreVersion else { throw fail("score_version 与绑定不一致") }
+        guard let scoreMax = root["score_max"]?.doubleValue, scoreMax == binding.scoreMax else {
+            throw fail("score_max 与绑定不一致")
+        }
+        let model = try text("model")
+        let effort = try text("effort")
+        guard model == selection.model, effort == selection.effort else { throw fail("模型/档位与请求不一致") }
+
+        guard let required = root["required_tasks"]?.intValue, required == binding.totalTasks else {
+            throw fail("required_tasks 与绑定不一致")
+        }
+        guard let coverage = root["coverage"]?.intValue, (0...required).contains(coverage) else {
+            throw fail("coverage 超出范围")
+        }
+        guard let graded = root["graded_runs_count"]?.intValue, graded >= 0 else {
+            throw fail("graded_runs_count 无效")
+        }
+
+        // score：null / 缺失 = 无成绩；数值必须落在 0...score_max（0 是真实 0 分）。
+        var score: Double?
+        if let value = root["score"], !value.isNull {
+            guard let number = value.doubleValue, (0...scoreMax).contains(number) else {
+                throw fail("score 超出 0...\(scoreMax)")
+            }
+            score = number
+        }
+        let status = try text("score_status")
+        if status == "complete" {
+            guard coverage == required, score != nil else { throw fail("complete 状态与覆盖/分数不一致") }
+        }
+        if score != nil, coverage == 0 { throw fail("有分数但覆盖为 0") }
+
+        // 统计：缺失 / 不可用时费用与耗时一律视为未知（nil），不当 0。
+        let statistics = root["statistics"]
+        let sampleCount = statistics?["sample_count"]?.intValue
+        var elapsed: RadarBenchMetric?
+        var cost: RadarBenchMetric?
+        let statisticsState = root["statistics_state"]?.stringValue ?? statistics?["statistics_state"]?.stringValue
+        if statisticsState == "available", let metrics = statistics?["metrics"] {
+            elapsed = try parseMetric(metrics["elapsed_ms"], sampleCount: sampleCount, name: "elapsed_ms")
+            cost = try parseMetric(metrics["api_equivalent_usd"], sampleCount: sampleCount, name: "api_equivalent_usd")
+        }
+
+        let detail = root["detail_metrics"]
+        return RadarBenchObservation(
+            selection: selection, schema: schema, benchmark: benchmark, catalogVersion: catalog,
+            taskSetSHA256: sha, scoreVersion: scoreVersion, scoreMax: scoreMax,
+            score: score, scoreStatus: status, coverage: coverage, requiredTasks: required,
+            gradedRunsCount: graded, sampleCount: sampleCount,
+            costBasis: statistics?["cost_basis"]?.stringValue,
+            elapsed: elapsed, apiEquivalentUSD: cost,
+            latestGradedAt: detail?["latest_graded_at"]?.stringValue.flatMap(parseSourceDate),
+            sourceAsOf: detail?["as_of"]?.stringValue.flatMap(parseSourceDate),
+            raw: root
+        )
+    }
+
+    private static func parseMetric(_ value: JSONValue?, sampleCount: Int?, name: String) throws -> RadarBenchMetric? {
+        guard let value, value.objectValue != nil else { return nil }
+        guard let known = value["known_samples"]?.intValue, known >= 0,
+              let missing = value["missing_samples"]?.intValue, missing >= 0 else {
+            throw RadarBenchError.invalidObservation("\(name) 样本计数无效")
+        }
+        if let sampleCount, known + missing != sampleCount {
+            throw RadarBenchError.invalidObservation("\(name) 样本数与 sample_count 不一致")
+        }
+        var knownTotal: Double?
+        if known > 0 {
+            guard let total = value["known_total"]?.doubleValue, total >= 0 else {
+                throw RadarBenchError.invalidObservation("\(name) known_total 无效")
+            }
+            knownTotal = total
+        }
+        return RadarBenchMetric(
+            knownTotal: knownTotal, knownSamples: known, missingSamples: missing,
+            missingReason: value["missing_reason"]?.stringValue
+        )
+    }
+
+    /// 来源侧时间戳（带微秒小数秒，如 2026-10-18T00:59:23.459695Z）；解析失败返回 nil，不拿别的时间顶替。
+    static func parseSourceDate(_ iso: String) -> Date? {
+        if let date = RadarParser.parseISO(iso) { return date }
+        let trimmed = iso.replacingOccurrences(of: #"(\.\d{3})\d+"#, with: "$1", options: .regularExpression)
+        return trimmed == iso ? nil : RadarParser.parseISO(trimmed)
+    }
+
+    // MARK: 快照
+
+    /// 把绑定 + 逐档读取状态组装成快照。年龄超过 24h（或时间在未来）的观测被剔除，不展示、不参与推荐。
+    /// 没有任何有效观测时返回 nil（调用方保持「无数据」）。成功读取过的行永远不会被后来的失败读取替换。
+    static func makeSnapshot(
+        binding: RadarBenchBinding, entries: [String: RadarBenchEntry], now: Date
+    ) -> RadarSnapshot? {
+        var live: [String: RadarBenchEntry] = [:]
+        for selection in binding.selections {
+            guard var entry = entries[selection.id] else { continue }
+            if entry.observation != nil {
+                let age = entry.fetchedAt.map { now.timeIntervalSince($0) } ?? .infinity
+                if age > RadarBenchPolicy.maxCacheAge || age < -300 {
+                    entry.observation = nil
+                    entry.fetchedAt = nil
+                }
+            }
+            if entry.observation != nil || entry.lastError != nil { live[selection.id] = entry }
+        }
+        let context = RadarBenchContext(binding: binding, entries: live)
+
+        let ranked: [(index: Int, model: ScoredModel)] = binding.selections.enumerated().compactMap { index, selection in
+            guard let entry = live[selection.id], let obs = entry.observation, let fetchedAt = entry.fetchedAt else {
+                return nil
+            }
+            let result = ModelResult(
+                name: selection.model, depth: selection.effort,
+                iq: obs.score ?? 0, passed: 0, tasks: obs.coverage,
+                cost: obs.apiEquivalentUSD?.knownMean ?? 0,
+                timeMinutes: Int(((obs.elapsed?.knownMean ?? 0) / 60_000).rounded()),
+                family: .codex, isReference: false, bench: obs
+            )
+            let stale = entry.lastError != nil || now.timeIntervalSince(fetchedAt) > RadarBenchPolicy.staleAfter
+            let model = ScoredModel(
+                result: result,
+                score: obs.score.map { min(max($0 / obs.scoreMax, 0), 1) } ?? 0,
+                benchRead: BenchReadInfo(fetchedAt: fetchedAt, isStale: stale, lastError: entry.lastError)
+            )
+            return (index, model)
+        }
+        guard !ranked.isEmpty else { return nil }
+
+        // 分数降序（缺失分数排最后），同分保持绑定顺序。
+        let sorted = ranked.sorted { lhs, rhs in
+            switch (lhs.model.result.bench?.score, rhs.model.result.bench?.score) {
+            case let (l?, r?): return l != r ? l > r : lhs.index < rhs.index
+            case (_?, nil): return true
+            case (nil, _?): return false
+            case (nil, nil): return lhs.index < rhs.index
+            }
+        }.map(\.model)
+
+        // 绑定里若出现 claude-* 竞品，沿用既有并入 Claude Code 分区的路径；目前绑定只有 gpt-*，该分区为空并被隐藏。
+        let (codex, claude) = RadarParser.mergeAnthropicIntoClaude(codex: sorted, claude: [])
+        return RadarSnapshot(
+            all: codex + claude,
+            updatedAt: context.latestReadAt ?? now,
+            claudeStatus: .ok,
+            codexSource: .website,
+            benchmark: context
+        )
     }
 }

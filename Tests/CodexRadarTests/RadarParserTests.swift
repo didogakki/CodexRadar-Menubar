@@ -31,6 +31,82 @@ final class RadarParserTests: XCTestCase {
         XCTAssertEqual(scored[1].score, 0.6420846103055999, accuracy: 1e-9)
     }
 
+    // MARK: - Radar Bench 耗时：原始 elapsed_ms 均值保持秒级精度（有效性过滤 / 1.1 倍耗时判断 / 展示）
+
+    /// 由真实样本改写出一个 Radar Bench 行：score 相同，费用 / 平均耗时（秒）可控，样本齐全。
+    private func benchRow(_ index: Int, cost: Double, elapsedSeconds: Double) throws -> ScoredModel {
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+        let selection = BenchFixtures.selections[index]
+        var object = BenchFixtures.summaryObject(selection, score: 100.0, costKnown: 80, costMissing: 0, costTotal: cost * 80)
+        var statistics = object["statistics"] as! [String: Any]
+        var metrics = statistics["metrics"] as! [String: Any]
+        let totalMs = elapsedSeconds * 1000 * 80
+        metrics["elapsed_ms"] = [
+            "total": totalMs, "mean": totalMs / 80, "known_total": totalMs,
+            "known_samples": 80, "missing_samples": 0, "missing_reason": NSNull(),
+        ] as [String: Any]
+        statistics["metrics"] = metrics
+        object["statistics"] = statistics
+        let observation = try RadarBenchParser.parseObservation(
+            json: try JSONSerialization.data(withJSONObject: object), binding: binding, selection: selection)
+        // 与 RadarBenchParser.makeSnapshot 一致：timeMinutes 只是分钟取整后的兼容字段。
+        let result = ModelResult(
+            name: selection.model, depth: selection.effort, iq: 100, passed: 0, tasks: observation.coverage,
+            cost: observation.apiEquivalentUSD?.knownMean ?? 0,
+            timeMinutes: Int(((observation.elapsed?.knownMean ?? 0) / 60_000).rounded()),
+            family: .codex, isReference: false, bench: observation)
+        return ScoredModel(result: result, score: 100.0 / 150)
+    }
+
+    /// 压制者（便宜）与被比较者（贵）：返回被比较者的结论。
+    private func verdict(dominatorSeconds: Double, victimSeconds: Double) throws -> CostVerdict {
+        let dominator = try benchRow(0, cost: 1, elapsedSeconds: dominatorSeconds)
+        let victim = try benchRow(1, cost: 3, elapsedSeconds: victimSeconds)
+        return try XCTUnwrap(CostEfficiency.verdicts(in: [dominator, victim])[victim.id])
+    }
+
+    func testBenchElapsed_subMinuteRowsAreValid_andShowSeconds() throws {
+        let fast = try benchRow(0, cost: 1, elapsedSeconds: 20)
+        XCTAssertEqual(fast.result.timeMinutes, 0, "分钟兼容字段取整后是 0")
+        XCTAssertEqual(fast.result.effectiveTimeSeconds, 20, accuracy: 1e-9)
+        XCTAssertEqual(fast.validTimeLabel, "20s", "有效 <1 分钟显示秒数，不出现有效 0m")
+        // 旧实现按取整后的分钟 0 判无效，<30s 的行永远进不了性价比比较。
+        let result = try verdict(dominatorSeconds: 20, victimSeconds: 22)
+        XCTAssertEqual(result.dominator?.result.depth, "low")
+        XCTAssertEqual(result.badgeLabel, "×3.0")
+    }
+
+    func testBenchElapsed_30sVersus89sNotCollapsedByMinuteRounding() throws {
+        // 30s、89s 在旧的分钟取整里都是 1m，会被当成「耗时相同」。
+        XCTAssertFalse(try verdict(dominatorSeconds: 89, victimSeconds: 30).isDominated, "89s 比 30s 慢得多，不能压制")
+        XCTAssertTrue(try verdict(dominatorSeconds: 30, victimSeconds: 89).isDominated)
+    }
+
+    func testBenchElapsed_timeToleranceBoundaryIs1Point1x() throws {
+        XCTAssertTrue(try verdict(dominatorSeconds: 110, victimSeconds: 100).isDominated, "恰好 1.1 倍仍算不明显更慢")
+        XCTAssertFalse(try verdict(dominatorSeconds: 111, victimSeconds: 100).isDominated, "超过 1.1 倍不能压制")
+    }
+
+    func testBenchElapsed_labelsAndConservativeMissingHandling() throws {
+        XCTAssertEqual(try benchRow(0, cost: 1, elapsedSeconds: 89).validTimeLabel, "1m")
+        XCTAssertEqual(try benchRow(0, cost: 1, elapsedSeconds: 59.7).validTimeLabel, "1m", "取整到 60s 时按分钟显示，不出现 60s")
+        XCTAssertEqual(try benchRow(0, cost: 1, elapsedSeconds: 5400).validTimeLabel, "1h30m")
+
+        // 没有耗时样本：仍是无效（nil），不伪装成 0s / 0m，也不参与性价比判定。
+        let missing = ModelResult(
+            name: "gpt-x", depth: "low", iq: 0, passed: 0, tasks: 0, cost: 0, timeMinutes: 0,
+            family: .codex, isReference: false)
+        XCTAssertEqual(missing.effectiveTimeSeconds, 0)
+        XCTAssertNil(ScoredModel(result: missing, score: 0).validTimeLabel)
+
+        // 旧数据路径：只有分钟精度，展示与比较口径不变。
+        let legacy = ModelResult(
+            name: "gpt-5.5", depth: "high", iq: 90, passed: 7, tasks: 12, cost: 20, timeMinutes: 85,
+            family: .codex, isReference: false)
+        XCTAssertEqual(legacy.effectiveTimeSeconds, 85 * 60)
+        XCTAssertEqual(ScoredModel(result: legacy, score: 1).validTimeLabel, "1h25m")
+    }
+
     // MARK: - scoreAndSort：passed > 8 封顶，避免综合分超过 1（真实数据已出现 passed: 9）
 
     func testScore_passedAbove8_sameAsPassedEqual8() {
@@ -1749,5 +1825,350 @@ final class RadarParserTests: XCTestCase {
         guard case .singleComparableTier = codexRadarGroup.outcome else {
             return XCTFail("codexRadar 分组只有一档，应为 singleComparableTier")
         }
+    }
+}
+
+// MARK: - Radar Bench（radar-bench-v2-150）：绑定 / 逐档成绩校验、分数口径、本地推荐前提
+
+final class RadarBenchParserTests: XCTestCase {
+
+    private let medium = BenchSelection(model: "gpt-6.1-sol", effort: "medium")
+
+    private func binding() throws -> RadarBenchBinding {
+        try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData())
+    }
+
+    private func realObservation() throws -> RadarBenchObservation {
+        try RadarBenchParser.parseObservation(json: Data(BenchFixtures.realSummaryJSON.utf8), binding: binding(), selection: medium)
+    }
+
+    private func mutatedSummary(_ change: (inout [String: Any]) -> Void) -> Data {
+        var object = BenchFixtures.realSummaryObject()
+        change(&object)
+        return try! JSONSerialization.data(withJSONObject: object)
+    }
+
+    // MARK: 绑定
+
+    func testParseBinding_siteShape_isAccepted() throws {
+        let binding = try binding()
+        XCTAssertEqual(binding.benchmark, BenchFixtures.benchmark)
+        XCTAssertEqual(binding.taskSetSHA256, BenchFixtures.sha)
+        XCTAssertEqual(binding.scoreVersion, "radar-bench-v2-150")
+        XCTAssertEqual(binding.scoreMax, 150)
+        XCTAssertEqual(binding.totalTasks, 64)
+        XCTAssertEqual(binding.selections.count, 34)
+        XCTAssertEqual(binding.selections.first, BenchSelection(model: "gpt-6.1-sol", effort: "low"))
+    }
+
+    func testParseBinding_rejectsInvalidBindings() {
+        let valid = BenchFixtures.bindingData()
+        func mutate(_ change: (inout [String: Any]) -> Void) -> Data {
+            var object = try! JSONSerialization.jsonObject(with: valid) as! [String: Any]
+            change(&object)
+            return try! JSONSerialization.data(withJSONObject: object)
+        }
+        let cases: [(String, Data)] = [
+            ("disabled", BenchFixtures.bindingData(enabled: false)),
+            ("production read not verified", BenchFixtures.bindingData(verified: false)),
+            ("sha too short", BenchFixtures.bindingData(sha: "abc")),
+            ("sha not hex", BenchFixtures.bindingData(sha: String(repeating: "z", count: 64))),
+            ("score_max zero", mutate { $0["score_max"] = 0 }),
+            ("score_max missing", mutate { $0.removeValue(forKey: "score_max") }),
+            ("total_tasks missing", mutate { $0.removeValue(forKey: "total_tasks") }),
+            ("source_counts mismatch", mutate { $0["source_counts"] = ["deepswe": 15, "pompeii": 16, "tb4": 14, "science": 18] }),
+            ("no selections", BenchFixtures.bindingData(selections: [])),
+            ("benchmark missing", mutate { $0.removeValue(forKey: "benchmark") }),
+            ("not an object", Data("[1,2]".utf8)),
+            ("not json", Data("error code: 502".utf8)),
+        ]
+        for (name, data) in cases {
+            XCTAssertThrowsError(try RadarBenchParser.parseBinding(json: data), name)
+        }
+    }
+
+    func testParseBinding_dedupesSelectionsKeepingBindingOrder() throws {
+        let a = BenchSelection(model: "gpt-6.1-sol", effort: "low")
+        let b = BenchSelection(model: "gpt-6-luna", effort: "max")
+        let binding = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData(selections: [a, b, a, b, a]))
+        XCTAssertEqual(binding.selections, [a, b])
+    }
+
+    // MARK: 真实响应样本
+
+    func testParseObservation_realSample_separatesScoreCoverageGradedRunsAndSamples() throws {
+        let observation = try realObservation()
+
+        XCTAssertEqual(observation.score!, 78.2121020962733, accuracy: 1e-12)
+        XCTAssertEqual(observation.scoreMax, 150)
+        XCTAssertEqual(observation.coverage, 64)
+        XCTAssertEqual(observation.requiredTasks, 64)
+        XCTAssertEqual(observation.gradedRunsCount, 80)
+        XCTAssertEqual(observation.scoreStatus, "complete")
+        XCTAssertTrue(observation.isComplete)
+
+        let elapsed = try XCTUnwrap(observation.elapsed)
+        XCTAssertTrue(elapsed.isComplete)
+        XCTAssertEqual(elapsed.knownSamples, 80)
+        XCTAssertEqual(elapsed.knownMean!, 47805382.86827114 / 80, accuracy: 1e-6)
+
+        let cost = try XCTUnwrap(observation.apiEquivalentUSD)
+        XCTAssertFalse(cost.isComplete, "79/80：有 1 个样本缺费用")
+        XCTAssertEqual(cost.knownSamples, 79)
+        XCTAssertEqual(cost.missingSamples, 1)
+        XCTAssertEqual(cost.totalSamples, 80)
+        XCTAssertEqual(cost.missingReason, "source_evidence_incomplete")
+        // 接口自带的 total/mean 在样本缺失时是 null；均值只能由 known_total / known_samples 算，且不是 /80。
+        XCTAssertEqual(cost.knownMean!, 28.957456 / 79, accuracy: 1e-12)
+        XCTAssertNotEqual(cost.knownMean!, 28.957456 / 80, accuracy: 1e-6)
+        XCTAssertEqual(observation.costBasis, "official_standard_api_equivalent; no estimates or claimed cash charges")
+    }
+
+    func testParseObservation_realSample_gradedTimeIsSourceTimeWithMicroseconds() throws {
+        let observation = try realObservation()
+        let expected = ISO8601DateFormatter().date(from: "2026-10-18T00:59:23Z")!.timeIntervalSince1970 + 0.459
+        XCTAssertEqual(try XCTUnwrap(observation.latestGradedAt).timeIntervalSince1970, expected, accuracy: 0.01)
+        XCTAssertNotNil(observation.sourceAsOf)
+    }
+
+    func testParseObservation_preservesUnknownFutureFieldsInRaw() throws {
+        let data = mutatedSummary { object in
+            object["future_top_level"] = ["nested": [1, 2, 3]]
+            var statistics = object["statistics"] as! [String: Any]
+            statistics["future_statistics_field"] = "kept"
+            object["statistics"] = statistics
+        }
+        let observation = try RadarBenchParser.parseObservation(json: data, binding: binding(), selection: medium)
+
+        XCTAssertEqual(observation.raw["future_top_level"]?["nested"]?.arrayValue?.count, 3)
+        XCTAssertEqual(observation.raw["statistics"]?["future_statistics_field"]?.stringValue, "kept")
+        XCTAssertNotNil(observation.raw["history"], "已建模之外的整段 history 也保留")
+    }
+
+    // MARK: 0 分 vs 缺失
+
+    func testScore_realZeroIsNotMissing_andMissingIsNotZero() throws {
+        let zero = try RadarBenchParser.parseObservation(
+            json: BenchFixtures.summaryData(medium, score: 0.0, coverage: 3, status: "provisional"),
+            binding: binding(), selection: medium)
+        let missing = try RadarBenchParser.parseObservation(
+            json: BenchFixtures.summaryData(medium, score: NSNull(), coverage: 0, status: "provisional"),
+            binding: binding(), selection: medium)
+
+        XCTAssertEqual(zero.score, 0)
+        XCTAssertNil(missing.score)
+        XCTAssertFalse(zero.isComplete)
+        XCTAssertFalse(missing.isComplete)
+
+        let snapshot = try XCTUnwrap(RadarBenchParser.makeSnapshot(
+            binding: binding(),
+            entries: [medium.id: RadarBenchEntry(observation: zero, fetchedAt: BenchFixtures.t0)],
+            now: BenchFixtures.t0))
+        XCTAssertEqual(snapshot.codexGroup.first?.iqLabel, "0.0")
+        let missingSnapshot = try XCTUnwrap(RadarBenchParser.makeSnapshot(
+            binding: binding(),
+            entries: [medium.id: RadarBenchEntry(observation: missing, fetchedAt: BenchFixtures.t0)],
+            now: BenchFixtures.t0))
+        XCTAssertEqual(missingSnapshot.codexGroup.first?.iqLabel, "—")
+        XCTAssertNil(missingSnapshot.codexGroup.first?.result.bench?.score)
+    }
+
+    func testSnapshot_missingScoreRowsSortLastAndZeroSortsAfterPositive() throws {
+        let b = try binding()
+        let low = BenchFixtures.selections[0], high = BenchFixtures.selections[1]
+        let none = BenchFixtures.selections[2], zero = BenchFixtures.selections[3]
+        func entry(_ s: BenchSelection, _ score: Any, _ coverage: Int) throws -> RadarBenchEntry {
+            RadarBenchEntry(observation: try RadarBenchParser.parseObservation(
+                json: BenchFixtures.summaryData(s, score: score, coverage: coverage, status: "provisional"),
+                binding: b, selection: s), fetchedAt: BenchFixtures.t0)
+        }
+        let snapshot = try XCTUnwrap(RadarBenchParser.makeSnapshot(
+            binding: b,
+            entries: [low.id: try entry(low, 40.0, 10), high.id: try entry(high, 70.0, 10),
+                      none.id: try entry(none, NSNull(), 0), zero.id: try entry(zero, 0.0, 2)],
+            now: BenchFixtures.t0))
+        XCTAssertEqual(snapshot.codexGroup.map(\.id), [high.id, low.id, zero.id, none.id])
+    }
+
+    // MARK: 拒绝无效响应
+
+    func testParseObservation_rejectsMismatchedIdentityAndInvalidValues() throws {
+        let b = try binding()
+        let otherSHA = String(repeating: "0", count: 64)
+        let cases: [(String, (inout [String: Any]) -> Void)] = [
+            ("benchmark", { $0["benchmark"] = "other" }),
+            ("sha", { $0["task_set_sha256"] = otherSHA }),
+            ("catalog", { $0["catalog_version"] = "other" }),
+            ("score_version", { $0["score_version"] = "radar-bench-v1-100" }),
+            ("score_max", { $0["score_max"] = 100 }),
+            ("model", { $0["model"] = "gpt-6.1-luna" }),
+            ("effort", { $0["effort"] = "high" }),
+            ("schema", { $0["schema"] = "something-else" }),
+            ("score above max", { $0["score"] = 150.5 }),
+            ("score negative", { $0["score"] = -1 }),
+            ("coverage above required", { $0["coverage"] = 65 }),
+            ("coverage negative", { $0["coverage"] = -1 }),
+            ("required_tasks differs from binding", { $0["required_tasks"] = 63 }),
+            ("complete but partial coverage", { $0["coverage"] = 63 }),
+            ("complete but no score", { $0["score"] = NSNull() }),
+            ("score with zero coverage", { $0["score_status"] = "provisional"; $0["coverage"] = 0 }),
+            ("status missing", { $0.removeValue(forKey: "score_status") }),
+            ("graded_runs_count negative", { $0["graded_runs_count"] = -1 }),
+            ("sample count mismatch", {
+                var statistics = $0["statistics"] as! [String: Any]
+                var metrics = statistics["metrics"] as! [String: Any]
+                var cost = metrics["api_equivalent_usd"] as! [String: Any]
+                cost["known_samples"] = 70
+                metrics["api_equivalent_usd"] = cost
+                statistics["metrics"] = metrics
+                $0["statistics"] = statistics
+            }),
+        ]
+        for (name, change) in cases {
+            XCTAssertThrowsError(
+                try RadarBenchParser.parseObservation(json: mutatedSummary(change), binding: b, selection: medium), name)
+        }
+    }
+
+    func testParseObservation_withoutStatistics_costAndTimeAreUnknownNotZero() throws {
+        let data = mutatedSummary { object in
+            object.removeValue(forKey: "statistics")
+            object["statistics_state"] = "unavailable"
+        }
+        let observation = try RadarBenchParser.parseObservation(json: data, binding: binding(), selection: medium)
+        XCTAssertNil(observation.elapsed)
+        XCTAssertNil(observation.apiEquivalentUSD)
+
+        let snapshot = try XCTUnwrap(RadarBenchParser.makeSnapshot(
+            binding: binding(),
+            entries: [medium.id: RadarBenchEntry(observation: observation, fetchedAt: BenchFixtures.t0)],
+            now: BenchFixtures.t0))
+        let row = try XCTUnwrap(snapshot.codexGroup.first)
+        XCTAssertNil(row.validCostLabel, "缺失费用不能显示成 $0.00")
+        XCTAssertNil(row.validTimeLabel)
+    }
+
+    // MARK: 展示口径
+
+    func testRow_costIsApiEquivalentKnownMean_flaggedPartialWith79Of80() throws {
+        let snapshot = try XCTUnwrap(RadarBenchParser.makeSnapshot(
+            binding: binding(),
+            entries: [medium.id: RadarBenchEntry(observation: try realObservation(), fetchedAt: BenchFixtures.t0)],
+            now: BenchFixtures.t0))
+        let row = try XCTUnwrap(snapshot.codexGroup.first)
+
+        XCTAssertEqual(row.validCostLabel, "$0.37*", "28.957456 / 79 = 0.3665，样本不全加 *")
+        XCTAssertEqual(row.validTimeLabel, "10m", "耗时 80/80 完整，无 *")
+        XCTAssertEqual(row.benchCostNote, "API 等价费用（非订阅扣费），已知 79/80 样本均值")
+        XCTAssertEqual(row.iqLabel, "78.2")
+        XCTAssertEqual(row.scoreCaption, "分")
+    }
+
+    func testScoreColor_newScaleDoesNotUseLegacyIQCutoffs() throws {
+        let b = try binding()
+        func row(_ score: Double) throws -> ScoredModel {
+            let observation = try RadarBenchParser.parseObservation(
+                json: BenchFixtures.summaryData(medium, score: score), binding: b, selection: medium)
+            let snapshot = RadarBenchParser.makeSnapshot(
+                binding: b, entries: [medium.id: RadarBenchEntry(observation: observation, fetchedAt: BenchFixtures.t0)],
+                now: BenchFixtures.t0)
+            return snapshot!.codexGroup[0]
+        }
+        // 旧阈值下 78.2 → 红、95 → 黄、120 → 绿；新量纲下完整覆盖一律中性色。
+        XCTAssertEqual(DS.scoreColor(try row(78.2)), DS.text92)
+        XCTAssertEqual(DS.scoreColor(try row(95)), DS.text92)
+        XCTAssertEqual(DS.scoreColor(try row(120)), DS.text92)
+        XCTAssertNotEqual(DS.scoreColor(try row(78.2)), DS.iqColor(78.2))
+        // 旧量纲行仍沿用旧阈值。
+        let legacy = ScoredModel(result: ModelResult(name: "gpt-5.5", depth: "medium", iq: 95, passed: 7, tasks: 12,
+                                                     cost: 5, timeMinutes: 20, family: .codex, isReference: false), score: 0.5)
+        XCTAssertEqual(DS.scoreColor(legacy), DS.iqColor(95))
+    }
+
+    // MARK: 本地推荐的可靠性前提
+
+    /// 在同一模型下构造若干档位：(effort, score, coverage, status, costKnown, costMissing, costTotal)。
+    private typealias Tier = (effort: String, score: Double, coverage: Int, status: String, costKnown: Int, costMissing: Int, costTotal: Double)
+
+    private func group(_ tiers: [Tier], expectedEfforts: [String]? = nil) throws -> ModelRecommendationGroup {
+        let model = "gpt-6.1-sol"
+        let selections = (expectedEfforts ?? tiers.map(\.effort)).map { BenchSelection(model: model, effort: $0) }
+        let b = try RadarBenchParser.parseBinding(json: BenchFixtures.bindingData(selections: selections))
+        var entries: [String: RadarBenchEntry] = [:]
+        for tier in tiers {
+            let selection = BenchSelection(model: model, effort: tier.effort)
+            let data = BenchFixtures.summaryData(
+                selection, score: tier.score, coverage: tier.coverage, status: tier.status,
+                costKnown: tier.costKnown, costMissing: tier.costMissing, costTotal: tier.costTotal)
+            entries[selection.id] = RadarBenchEntry(
+                observation: try RadarBenchParser.parseObservation(json: data, binding: b, selection: selection),
+                fetchedAt: BenchFixtures.t0)
+        }
+        let snapshot = try XCTUnwrap(RadarBenchParser.makeSnapshot(binding: b, entries: entries, now: BenchFixtures.t0))
+        return try XCTUnwrap(snapshot.recommendationGroups(for: .vendor(.openai)).first)
+    }
+
+    func testRecommendation_completeData_picksCheapestWithin95PercentOfBest() throws {
+        // 总费用 / 80 = 单样本均值：low 0.10、medium 0.30、high 0.50；best=100，门槛 95。
+        let g = try group([
+            ("low", 90, 64, "complete", 80, 0, 8),
+            ("medium", 96, 64, "complete", 80, 0, 24),
+            ("high", 100, 64, "complete", 80, 0, 40),
+        ])
+        guard case .recommended(let picked, let maxScore, let threshold) = g.outcome else {
+            return XCTFail("完整数据应给出本地推荐，实际 \(g.outcome)")
+        }
+        XCTAssertEqual(picked.result.depth, "medium")
+        XCTAssertEqual(maxScore, 100)
+        XCTAssertEqual(threshold, 95, accuracy: 1e-9)
+    }
+
+    func testRecommendation_79Of80CostOnACandidate_isUnavailableNotGuessed() throws {
+        let g = try group([
+            ("low", 90, 64, "complete", 80, 0, 8),
+            ("medium", 96, 64, "complete", 79, 1, 23.7),   // 候选，但费用样本 79/80
+            ("high", 100, 64, "complete", 80, 0, 40),
+        ])
+        guard case .unavailable(.incompleteCost) = g.outcome else {
+            return XCTFail("候选费用样本不全必须说明原因，实际 \(g.outcome)")
+        }
+    }
+
+    func testRecommendation_incompleteCostOutsideCandidates_doesNotBlock() throws {
+        let g = try group([
+            ("low", 60, 64, "complete", 79, 1, 4),         // 远低于门槛，不是候选，其费用缺失不影响结论
+            ("medium", 96, 64, "complete", 80, 0, 24),
+            ("high", 100, 64, "complete", 80, 0, 40),
+        ])
+        guard case .recommended(let picked, _, _) = g.outcome else { return XCTFail("实际 \(g.outcome)") }
+        XCTAssertEqual(picked.result.depth, "medium")
+    }
+
+    func testRecommendation_incompleteCoverageAnywhereInGroup_isUnavailable() throws {
+        let g = try group([
+            ("low", 90, 64, "complete", 80, 0, 8),
+            ("high", 100, 64, "complete", 80, 0, 40),
+            ("max", 80, 43, "provisional", 80, 0, 50),
+        ])
+        guard case .unavailable(.incompleteCoverage) = g.outcome else {
+            return XCTFail("覆盖不同的分数不可比，实际 \(g.outcome)")
+        }
+    }
+
+    func testRecommendation_missingTiers_isUnavailable() throws {
+        // 绑定里该模型有 3 档，只读到 2 档：缺的那档可能才是最高分。
+        let g = try group([
+            ("low", 90, 64, "complete", 80, 0, 8),
+            ("medium", 96, 64, "complete", 80, 0, 24),
+        ], expectedEfforts: ["low", "medium", "high"])
+        guard case .unavailable(.missingTiers) = g.outcome else { return XCTFail("实际 \(g.outcome)") }
+    }
+
+    func testRecommendation_allZeroOrMissingScores_hasNoBasis() throws {
+        let zeros = try group([
+            ("low", 0, 64, "complete", 80, 0, 8),
+            ("high", 0, 64, "complete", 80, 0, 40),
+        ])
+        guard case .unavailable(.noValidScore) = zeros.outcome else { return XCTFail("最高分为 0 无从比较，实际 \(zeros.outcome)") }
     }
 }
